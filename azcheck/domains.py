@@ -105,6 +105,20 @@ def _source(path: Path, line_number: int) -> str:
     return f"{path.as_posix()}:{line_number}"
 
 
+def _normalize_native_rule(value: str) -> str:
+    """Normalize DNS routing names, including single-label suffix rules."""
+    rule = value[:-1] if value.endswith(".") else value
+    if "." in rule:
+        return normalize_domain(value)
+    try:
+        rule = rule.lower().encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise DomainError("Invalid native suffix rule.") from exc
+    if not _LABEL.fullmatch(rule) or rule.isdigit():
+        raise DomainError("Invalid native suffix rule.")
+    return rule
+
+
 def _native_entries(path: Path, warnings: list[str]) -> tuple[list[tuple[str, int]], bool]:
     result = []
     catch_all = False
@@ -124,16 +138,7 @@ def _native_entries(path: Path, warnings: list[str]) -> tuple[list[tuple[str, in
             value = _NATIVE_CUT.split(value, maxsplit=1)[0]
             # Native RPZ lists also accept single-label suffix rules such as
             # 'com'. They affect child domains but are not HTTP probe targets.
-            rule = value[:-1] if value.endswith(".") else value
-            if "." not in rule:
-                try:
-                    rule = rule.lower().encode("idna").decode("ascii").lower()
-                except UnicodeError as exc:
-                    raise DomainError("Invalid native suffix rule.") from exc
-                if not _LABEL.fullmatch(rule) or rule.isdigit():
-                    raise DomainError("Invalid native suffix rule.")
-            else:
-                rule = normalize_domain(value)
+            rule = _normalize_native_rule(value)
             result.append((rule, number))
         except DomainError as exc:
             warnings.append(f"{_source(path, number)}: skipped invalid native entry ({exc})")
@@ -227,7 +232,7 @@ def _rpz_entries(path: Path, warnings: list[str]):
             continue
         if tokens[0].upper() == '$ORIGIN':
             try:
-                origin = '' if tokens[1] == '.' else normalize_domain(tokens[1])
+                origin = '' if tokens[1] == '.' else _normalize_native_rule(tokens[1])
             except (IndexError, DomainError):
                 unsupported += 1
             continue
@@ -251,7 +256,9 @@ def _rpz_entries(path: Path, warnings: list[str]):
             unsupported += 1
             continue
         wildcard = owner.startswith('*.') or owner == '*'
-        if owner in ('*', '*.'):
+        if owner == '@' and origin:
+            owner, kind = origin, 'exact'
+        elif owner in ('*', '*.'):
             if origin:
                 owner = origin
                 kind = 'wildcard' if wildcard else 'exact'
@@ -262,7 +269,7 @@ def _rpz_entries(path: Path, warnings: list[str]):
             if origin and not name.endswith('.'):
                 name += '.' + origin
             try:
-                owner = normalize_domain(name)
+                owner = _normalize_native_rule(name)
             except DomainError:
                 unsupported += 1
                 continue
@@ -374,7 +381,7 @@ def load_inventory(
         add_native(path)
     for path, records in rpz.items():
         for (kind, owner), (routed, number) in records.items():
-            if routed and kind == 'exact':
+            if routed and kind == 'exact' and '.' in owner:
                 add(owner, _source(path, number))
 
     def routed(domain):

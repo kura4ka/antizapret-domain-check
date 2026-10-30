@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=0.2.0
+VERSION=0.3.0
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
@@ -111,7 +111,7 @@ WRAPPER_SH
     if [[ ! -e $CONFIG_DIR/config.json ]]; then
         cat > "$stage/config.json" <<'CONFIG_JSON'
 {
-  "config_version": 2,
+  "config_version": 3,
   "antizapret_dir": "/root/antizapret",
   "report_dir": "/root/antizapret-domain-check/reports",
   "timeout_seconds": 8,
@@ -119,6 +119,8 @@ WRAPPER_SH
   "workers": 2,
   "interval_seconds": 0.5,
   "include_download": true,
+  "batch_size": 500,
+  "batch_pause_seconds": 300,
   "resolver_url": "https://1.1.1.1/dns-query"
 }
 CONFIG_JSON
@@ -141,7 +143,7 @@ original = config_path.read_bytes()
 document = json.loads(original.decode('utf-8'), object_pairs_hook=_pairs)
 upgraded = migrate_config(document)
 if upgraded != document:
-    descriptor, backup_name = tempfile.mkstemp(prefix='config.json.before-v0.2.', suffix='.bak', dir=str(config_path.parent))
+    descriptor, backup_name = tempfile.mkstemp(prefix='config.json.before-v0.3.', suffix='.bak', dir=str(config_path.parent))
     with os.fdopen(descriptor, 'wb') as backup:
         os.chmod(backup_name, 0o600)
         backup.write(original)
@@ -175,7 +177,9 @@ MIGRATE_CONFIG_PY
     fi
     log "Installed v$VERSION on this client VPS. Existing configuration and reports are preserved."
     log 'Check the inventory: antizapret-domain-check inventory'
-    log 'Run a check now: antizapret-domain-check scan'
+    log 'Run stages with saved progress: antizapret-domain-check scan'
+    log 'Run one stage only: antizapret-domain-check scan --one-batch'
+    log 'Default stages: 500 domains, then a 5-minute pause. Re-run scan to resume interrupted work.'
     log 'Default report: /root/antizapret-domain-check/reports/latest.txt'
     log 'Default candidates: /root/antizapret-domain-check/reports/suggested-include-warp-hosts.txt'
     log 'Custom report_dir settings are preserved. Historical reports in /var/lib are left in place.'

@@ -89,6 +89,167 @@ class ScannerTests(unittest.TestCase):
         self.assertCountEqual(seen, [entry.domain for entry in entries])
         self.assertEqual({result['decision'] for result in results}, {'reachable', 'inconclusive'})
 
+    def test_preexisting_stop_does_not_start_requests_or_complete_domains(self):
+        stop = threading.Event()
+        stop.set()
+        completed, events = [], []
+        with patch('azcheck.scanner.check_domain') as probe:
+            results = scan_inventory(Inventory([InventoryEntry('pending.example.org')], []),
+                                     probe_fn=probe, stop_event=stop,
+                                     completed=completed.append, event=events.append)
+        probe.assert_not_called()
+        self.assertEqual(results + completed + events, [])
+
+    def test_rate_limit_stops_queue_and_retries_but_checkpoints_inflight_results(self):
+        stop, barrier = threading.Event(), threading.Barrier(2)
+        started, completed, callback_threads = [], [], []
+        main_thread = threading.get_ident()
+        entries = [InventoryEntry(f'site{i}.example.org') for i in range(20)]
+
+        def probe(domain, **options):
+            started.append(domain)
+            barrier.wait(timeout=2)
+            if domain == entries[0].domain:
+                return outcome('rate_limited', 429, domain=domain)
+            self.assertTrue(stop.wait(2))
+            return outcome('blocked', 403, domain=domain)
+
+        def checkpoint(result):
+            completed.append(result)
+            callback_threads.append(threading.get_ident())
+
+        results = scan_inventory(Inventory(entries, []), probe_fn=probe, workers=2,
+                                 interval_seconds=0, retry_delay_seconds=30,
+                                 stop_event=stop, completed=checkpoint)
+        self.assertTrue(stop.is_set())
+        self.assertCountEqual(started, [entry.domain for entry in entries[:2]])
+        self.assertCountEqual(completed, results)
+        self.assertEqual(callback_threads, [main_thread, main_thread])
+        self.assertTrue(all(len(result['checks']) == 1 for result in results))
+        self.assertTrue(all(result['decision'] == 'inconclusive' for result in results))
+
+    def test_rate_limit_wakes_paced_workers_without_starting_another_request(self):
+        stop, seen = threading.Event(), []
+
+        def probe(domain, **options):
+            seen.append(domain)
+            return outcome('rate_limited', 429, domain=domain)
+
+        entries = [InventoryEntry(f'site{i}.example.org') for i in range(8)]
+        results = scan_inventory(Inventory(entries, []), probe_fn=probe, workers=4,
+                                 interval_seconds=30, stop_event=stop)
+        self.assertEqual(seen, [entries[0].domain])
+        self.assertEqual(len(results), 1)
+
+    def test_keyboard_interrupt_drains_callbacks_once_on_main_thread(self):
+        stop, barrier = threading.Event(), threading.Barrier(2)
+        entries = [InventoryEntry(f'site{i}.example.org') for i in range(12)]
+        completed, callback_threads, seen = [], [], []
+
+        def probe(domain, **options):
+            seen.append(domain)
+            barrier.wait(timeout=2)
+            if domain != entries[0].domain:
+                self.assertTrue(stop.wait(2))
+            return outcome(domain=domain)
+
+        def checkpoint(result):
+            completed.append(result)
+            callback_threads.append(threading.get_ident())
+
+        def interrupt(done, total):
+            if done == 1:
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            scan_inventory(Inventory(entries, []), probe_fn=probe, workers=2,
+                           interval_seconds=0, retry_delay_seconds=0,
+                           stop_event=stop, completed=checkpoint, progress=interrupt)
+        self.assertTrue(stop.is_set())
+        self.assertCountEqual(seen, [entry.domain for entry in entries[:2]])
+        self.assertCountEqual([result['domain'] for result in completed], seen)
+        self.assertEqual(callback_threads, [threading.get_ident()] * 2)
+
+    def test_streamed_reports_accept_single_pass_results_and_cumulative_suggestions(self):
+        entries = [InventoryEntry('new.example.org'), InventoryEntry('ok.example.org')]
+        inventory = Inventory(entries, [], {'coverage': 'synthetic'})
+        results = scan_inventory(inventory, probe_fn=lambda domain, **kw: outcome(
+            'blocked' if domain.startswith('new') else 'ok',
+            403 if domain.startswith('new') else 200, domain=domain),
+            interval_seconds=0, retry_delay_seconds=0)
+        progress = {'run_id': 'synthetic', 'completed': 4, 'total': 8,
+                    'batch': 2, 'scope': 'latest_batch'}
+
+        class SinglePass:
+            used = False
+
+            def __iter__(self):
+                if self.used:
+                    raise AssertionError('Result stream was reread.')
+                self.used = True
+                yield from results
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = write_reports(directory, inventory, SinglePass(), result_count=2,
+                                   counts={'candidate': 1, 'reachable': 1}, progress=progress,
+                                   suggestions=iter(('old.example.org', 'new.example.org')))
+            self.assertNotIn('results', report)
+            saved = json.loads((Path(directory) / 'latest.json').read_text())
+            self.assertEqual(saved['results'], results)
+            self.assertEqual(saved['progress'], progress)
+            self.assertEqual(saved['counts'], {'candidate': 1, 'reachable': 1})
+            text = (Path(directory) / 'latest.txt').read_text(encoding='utf-8')
+            self.assertIn('completed=4', text)
+            self.assertIn('scope=latest_batch', text)
+            suggestions = (Path(directory) / 'suggested-include-warp-hosts.txt').read_text()
+            self.assertIn('old.example.org\nnew.example.org\n', suggestions)
+
+    def test_report_stream_failure_preserves_previous_reports_and_cleans_temporary_files(self):
+        inventory = Inventory([InventoryEntry('example.org')], [])
+        result = scan_inventory(inventory, probe_fn=lambda domain, **kw: outcome(domain=domain),
+                                interval_seconds=0)[0]
+
+        def broken():
+            yield result
+            raise RuntimeError('Synthetic interrupted report stream.')
+
+        names = ('latest.txt', 'latest.json', 'suggested-include-warp-hosts.txt')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in names:
+                (root / name).write_text('Previous report.\n')
+            with self.assertRaisesRegex(RuntimeError, 'interrupted report stream'):
+                write_reports(directory, inventory, broken())
+            for name in names:
+                self.assertEqual((root / name).read_text(), 'Previous report.\n')
+            self.assertCountEqual([path.name for path in root.iterdir()], names)
+
+    def test_report_generator_does_not_keep_prior_result_objects_in_memory(self):
+        inventory = Inventory([], [])
+
+        class TrackedResult(dict):
+            live = maximum = 0
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                type(self).live += 1
+                type(self).maximum = max(type(self).maximum, type(self).live)
+
+            def __del__(self):
+                type(self).live -= 1
+
+        def streamed():
+            for index in range(250):
+                yield TrackedResult(domain=f'site{index}.example.org', sources=[],
+                                    decision='reachable', reason='Synthetic result.', checks=[])
+
+        with tempfile.TemporaryDirectory() as directory:
+            write_reports(directory, inventory, streamed(), result_count=250,
+                          counts={'reachable': 250})
+            saved = json.loads((Path(directory) / 'latest.json').read_text())
+            self.assertEqual(len(saved['results']), 250)
+        self.assertLessEqual(TrackedResult.maximum, 2)
+
     def test_reports_only_list_candidates_and_preserve_sources_and_warnings(self):
         entries = [InventoryEntry('blocked.example.org', ['include-hosts.txt:4']),
                    InventoryEntry('excluded.example.org', ['include-hosts.txt:5'], excluded=True)]
@@ -179,6 +340,7 @@ class CLITests(unittest.TestCase):
                 calls.append(inventory)
                 return scan_inventory(inventory, probe_fn=lambda domain, **kw: outcome(domain=domain),
                                       interval_seconds=0, retry_delay_seconds=0,
+                                      completed=options.get('completed'),
                                       event=options.get('event'), progress=options.get('progress'))
 
             arguments = ['scan', '--az-dir', str(az), '--report-dir', str(root / 'reports')]
@@ -197,6 +359,34 @@ class CLITests(unittest.TestCase):
             saved = json.loads((root / 'reports/latest.json').read_text())
             self.assertTrue(saved['inventory']['include_download'])
             self.assertEqual(len(saved['inventory']['registry_files']), 1)
+
+    def test_large_inventory_explains_runtime_and_reports_completed_progress(self):
+        inventory = Inventory([InventoryEntry('synthetic.example')] * 776634, [])
+
+        def synthetic_scan(collected, **options):
+            self.assertEqual([entry.domain for entry in collected.entries], ['synthetic.example'])
+            options['progress'](100, len(collected.entries))
+            options['progress'](101, len(collected.entries))
+            options['progress'](200, len(collected.entries))
+            options['completed']({'domain': 'synthetic.example', 'decision': 'reachable',
+                                  'checks': [outcome()], 'sources': [], 'reason': 'Synthetic check.'})
+            return []
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('azcheck.cli.load_inventory', return_value=inventory), \
+             patch('azcheck.cli.shutil.which', return_value='curl'), \
+             patch('azcheck.cli.time.monotonic', side_effect=[100, 161, 162, 222]), \
+             patch('azcheck.cli.scan_inventory', side_effect=synthetic_scan), \
+             patch('azcheck.cli.write_reports', return_value={'counts': {}}):
+            code, _, error = self.run_cli(['scan', '--report-dir', directory, '--one-batch'])
+        self.assertEqual(code, 0, error)
+        self.assertIn('Checking 776634 domains', error)
+        self.assertIn('Pacing alone requires at least 4d 11h', error)
+        self.assertIn('Completed checks are saved for resume.', error)
+        self.assertIn('Progress: 100/776634 completed (0.01%)', error)
+        self.assertIn('Progress: 200/776634 completed', error)
+        self.assertIn('rough remaining', error)
+        self.assertEqual(error.count('Progress:'), 2)
 
     def test_empty_or_missing_inventory_does_not_produce_successful_empty_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -234,7 +424,8 @@ class CLITests(unittest.TestCase):
             def synthetic_scan(inventory, **options):
                 observed.append([entry.domain for entry in inventory.entries])
                 return scan_inventory(inventory, probe_fn=lambda domain, **kw: outcome(domain=domain),
-                                      interval_seconds=0, retry_delay_seconds=0)
+                                      interval_seconds=0, retry_delay_seconds=0,
+                                      completed=options.get('completed'))
 
             with patch('azcheck.cli.scan_inventory', side_effect=synthetic_scan), patch('azcheck.cli.shutil.which', return_value='curl'):
                 for text in ('first.example.org\n', 'first.example.org\nsecond.example.org\n'):

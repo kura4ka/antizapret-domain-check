@@ -1,7 +1,9 @@
 """Network-free checks for public DNS and bounded HTTPS probes."""
 
 import json
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +17,13 @@ def dns_answer(*addresses):
 def dns_result(document=None, raw=None, code=200, curl_code=0):
     payload = raw if raw is not None else json.dumps(document if document is not None else dns_answer('93.184.215.14')).encode()
     return subprocess.CompletedProcess([], curl_code, payload + b'\n' + str(code).encode(), b'')
+
+
+def header_response(completed, headers):
+    def respond(command, **options):
+        Path(command[command.index('--dump-header') + 1]).write_bytes(headers)
+        return completed
+    return respond
 
 
 class ProbeTests(unittest.TestCase):
@@ -57,6 +66,68 @@ class ProbeTests(unittest.TestCase):
                 result, _ = self.run_probe(code=code)
                 self.assertEqual(result['status'], expected)
                 self.assertEqual(result['http_status'], code)
+
+    def test_dns_http429_stops_before_https_and_retains_retry_after(self):
+        responder = header_response(dns_result(code=429, curl_code=22),
+                                    b'HTTP/2 429\r\nRetry-After: 120\r\n\r\n')
+        with patch.object(probe.subprocess, 'run', side_effect=responder) as run:
+            result = probe.check_domain('example.com')
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(result['status'], 'rate_limited')
+        self.assertEqual(result['http_status'], 429)
+        self.assertEqual(result['curl_code'], 22)
+        self.assertEqual(result['retry_after_seconds'], 120)
+        self.assertIn('DNS resolver', result['detail'])
+        command = run.call_args.args[0]
+        self.assertFalse(Path(command[command.index('--dump-header') + 1]).exists())
+
+    def test_https429_and_http11_fallback_retain_retry_after_without_another_request(self):
+        for initial_error in (False, True):
+            with self.subTest(http11_fallback=initial_error):
+                results = [dns_result()]
+                if initial_error:
+                    results.append(subprocess.CompletedProcess([], 92, '000\n93.184.215.14\n', ''))
+                limited = subprocess.CompletedProcess([], 0, '429\n93.184.215.14\n', '')
+                responder = header_response(limited, b'HTTP/1.1 429 Too Many Requests\r\nretry-after: 3600\r\n\r\n')
+
+                def respond(command, **options):
+                    if results:
+                        return results.pop(0)
+                    return responder(command, **options)
+
+                with patch.object(probe.subprocess, 'run', side_effect=respond) as run:
+                    result = probe.check_domain('example.com')
+                self.assertEqual(run.call_count, 3 if initial_error else 2)
+                self.assertEqual(result['status'], 'rate_limited')
+                self.assertEqual(result['retry_after_seconds'], 3600)
+                self.assertIn('HTTP 429', result['detail'])
+                if initial_error:
+                    self.assertIn('HTTP/1.1', result['detail'])
+
+    def test_known_http429_is_not_retried_even_when_curl_reports_http2_stream_error(self):
+        responses = [dns_result(), subprocess.CompletedProcess([], 92, '429\n93.184.215.14\n', '')]
+        with patch.object(probe.subprocess, 'run', side_effect=responses) as run:
+            result = probe.check_domain('example.com')
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(result['status'], 'rate_limited')
+        self.assertEqual(result['curl_code'], 92)
+
+    def test_retry_after_http_dates_final_response_and_invalid_headers(self):
+        cases = (
+            (b'HTTP/2 429\r\nRetry-After: Thu, 01 Jan 1970 01:00:00 GMT\r\n', 3600),
+            (b'HTTP/2 429\r\nRetry-After: Wed, 31 Dec 1969 23:00:00 GMT\r\n', 0),
+            (b'HTTP/1.1 100 Continue\r\nRetry-After: 9000\r\n\r\nHTTP/2 429\r\nRetry-After: 30\r\n', 30),
+            (b'HTTP/1.1 100 Continue\r\nRetry-After: 9000\r\n\r\nHTTP/2 429\r\n', None),
+            (b'HTTP/2 429\r\nRetry-After: -1\r\nRetry-After: not-a-date\r\n', None),
+            (b'HTTP/2 429\r\nRetry-After:\r\n', None),
+            (b'HTTP/2 429\r\nRetry-After: 90\r\n' + b'x' * probe.MAX_HEADER_BYTES, None),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            header_path = Path(directory) / 'headers'
+            for headers, expected in cases:
+                with self.subTest(headers=headers[:100]), patch.object(probe.time, 'time', return_value=0):
+                    header_path.write_bytes(headers)
+                    self.assertEqual(probe._read_retry_after(header_path), expected)
 
     def test_private_reserved_multicast_and_mixed_answers_are_skipped(self):
         for address in ('127.0.0.1', '10.0.0.1', '169.254.169.254', '192.0.2.1', '224.0.0.1', '100.64.0.1'):
@@ -110,6 +181,66 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'transport_error')
         self.assertEqual(result['curl_code'], 28)
         self.assertIsNone(result['http_status'])
+
+    def test_http2_stream_error_retries_once_with_http11_and_keeps_https_constraints(self):
+        http2_error = subprocess.CompletedProcess([], 92, '000\n93.184.215.14\n', '')
+        success = subprocess.CompletedProcess([], 0, '200\n93.184.215.14\n', '')
+        with patch.object(probe.subprocess, 'run', side_effect=[dns_result(), http2_error, success]) as run:
+            result = probe.check_domain('example.com')
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['http_status'], 200)
+        self.assertEqual(result['curl_code'], 0)
+        self.assertIn('curl 92', result['detail'])
+        self.assertIn('retried HTTPS HEAD once with HTTP/1.1', result['detail'])
+        self.assertEqual(run.call_count, 3)
+        initial_call, fallback_call = run.call_args_list[1:]
+        self.assertNotIn('--http1.1', initial_call.args[0])
+        self.assertEqual(fallback_call.args[0], initial_call.args[0][:2] + ['--http1.1'] + initial_call.args[0][2:])
+        command = fallback_call.args[0]
+        self.assertIn('--head', command)
+        self.assertEqual(command[command.index('--resolve') + 1], 'example.com:443:93.184.215.14')
+        self.assertEqual(command[command.index('--proxy') + 1], '')
+        self.assertEqual(command[command.index('--noproxy') + 1], '*')
+        self.assertEqual(command[command.index('--max-time') + 1], '8.0')
+        self.assertEqual(fallback_call.kwargs['timeout'], 9.0)
+        self.assertFalse(fallback_call.kwargs['shell'])
+        self.assertNotIn('--location', command)
+        self.assertNotIn('--insecure', command)
+
+    def test_failed_http11_fallback_keeps_final_exit_code_without_further_retries(self):
+        for curl_code in (92, 60, 28):
+            with self.subTest(curl_code=curl_code):
+                failed = subprocess.CompletedProcess([], curl_code, '000\n93.184.215.14\n', '')
+                with patch.object(probe.subprocess, 'run', side_effect=[
+                    dns_result(), subprocess.CompletedProcess([], 92, '000\n\n', ''), failed,
+                ]) as run:
+                    result = probe.check_domain('example.com')
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(result['status'], 'transport_error')
+                self.assertEqual(result['curl_code'], curl_code)
+                self.assertIn('HTTP/1.1', result['detail'])
+                self.assertIn('failed (curl ' + str(curl_code) + ')', result['detail'])
+
+    def test_http11_fallback_timeout_remains_bounded_and_identifiable(self):
+        with patch.object(probe.subprocess, 'run', side_effect=[
+            dns_result(), subprocess.CompletedProcess([], 92, '000\n\n', ''),
+            subprocess.TimeoutExpired('curl', 9),
+        ]) as run:
+            result = probe.check_domain('example.com')
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(result['status'], 'transport_error')
+        self.assertEqual(result['curl_code'], 28)
+        self.assertIn('HTTP/1.1', result['detail'])
+        self.assertIn('timed out', result['detail'])
+
+    def test_certificate_and_other_transport_errors_do_not_use_http11_fallback(self):
+        for curl_code in (60, 7, 28, 35, 56):
+            with self.subTest(curl_code=curl_code):
+                result, run = self.run_probe(curl_code=curl_code, output='000\n\n')
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(result['curl_code'], curl_code)
+                self.assertNotIn('HTTP/1.1', result['detail'])
+                self.assertNotIn('--http1.1', run.call_args.args[0])
 
     def test_unconfirmed_or_wrong_remote_address_is_not_success(self):
         for output in ('200\n10.0.0.1\n', '200\n', '000\n93.184.215.14\n', 'x' * 1025):

@@ -12,7 +12,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "@@AZCHECK_PAYLOAD@@"
-REQUIRED_MODULES = {"__init__.py", "__main__.py", "cli.py", "domains.py", "probe.py", "scanner.py"}
+REQUIRED_MODULES = {"__init__.py", "__main__.py", "checkpoint.py", "cli.py", "domains.py", "probe.py", "scanner.py"}
 
 
 def payload_files() -> list[Path]:

@@ -10,12 +10,17 @@ import math
 import os
 import re
 import subprocess
+import tempfile
+import time
 import urllib.parse
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
 
 DEFAULT_RESOLVER = 'https://1.1.1.1/dns-query'
 MAX_DNS_BYTES = 65536
 MAX_DNS_ANSWERS = 128
+MAX_HEADER_BYTES = 65536
 _LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 
 
@@ -25,6 +30,13 @@ class ProbeError(ValueError):
 
 class _DNSProblem(Exception):
     pass
+
+
+class _DNSRateLimited(_DNSProblem):
+    def __init__(self, retry_after_seconds=None, curl_code=None):
+        super().__init__('Public DNS resolver returned HTTP 429; further checks should pause.')
+        self.retry_after_seconds = retry_after_seconds
+        self.curl_code = curl_code
 
 
 class _NonPublicAnswer(Exception):
@@ -87,6 +99,35 @@ def validate_resolver_url(value):
         raise ProbeError('Resolver must use HTTPS, a public address or DNS name, and port 443 without credentials.') from exc
 
 
+def _read_retry_after(path):
+    """Read only bounded headers, using Retry-After from the final response."""
+    try:
+        with open(path, 'rb') as handle:
+            headers = handle.read(MAX_HEADER_BYTES + 1)
+    except OSError:
+        return None
+    if len(headers) > MAX_HEADER_BYTES:
+        return None
+    values = []
+    for line in headers.decode('latin-1').splitlines():
+        if line.upper().startswith('HTTP/'):
+            values = []
+        elif line.lower().startswith('retry-after:'):
+            value = line.split(':', 1)[1].strip()
+            try:
+                if re.fullmatch(r'[0-9]{1,20}', value):
+                    delay = int(value)
+                else:
+                    date = parsedate_to_datetime(value)
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=timezone.utc)
+                    delay = max(0, math.ceil(date.timestamp() - time.time()))
+            except (ValueError, TypeError, OverflowError):
+                continue
+            values.append(delay)
+    return max(values) if values else None
+
+
 def _public_address(domain, timeout, resolver_url):
     parsed = urllib.parse.urlsplit(resolver_url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -101,13 +142,19 @@ def _public_address(domain, timeout, resolver_url):
         '--user-agent', 'AntiZapret-Domain-Check/0.1', '--write-out', '\n%{http_code}', url,
     ]
     try:
-        completed = subprocess.run(command, capture_output=True, timeout=timeout + 1,
-                                   check=False, shell=False)
+        with tempfile.TemporaryDirectory(prefix='azcheck-headers-') as directory:
+            header_path = os.path.join(directory, 'headers')
+            command[-1:-1] = ['--dump-header', header_path]
+            completed = subprocess.run(command, capture_output=True, timeout=timeout + 1,
+                                       check=False, shell=False)
+            retry_after = _read_retry_after(header_path)
+        payload, separator, http_status = completed.stdout.rpartition(b'\n')
+        if separator and http_status == b'429':
+            raise _DNSRateLimited(retry_after, completed.returncode)
         if completed.returncode:
             raise _DNSProblem('Public DNS request failed (curl ' + str(completed.returncode) + ').')
         if len(completed.stdout) > MAX_DNS_BYTES + 4:
             raise _DNSProblem('DNS response exceeded the size limit.')
-        payload, separator, http_status = completed.stdout.rpartition(b'\n')
         if not separator or http_status != b'200':
             raise _DNSProblem('Resolver did not return HTTP 200.')
         if len(payload) > MAX_DNS_BYTES:
@@ -148,16 +195,21 @@ def _public_address(domain, timeout, resolver_url):
         raise _DNSProblem('Public DNS lookup failed or timed out.') from exc
 
 
-def _result(domain, status, detail, *, http_status=None, curl_code=None, address=None):
-    return {'domain': domain, 'status': status, 'http_status': http_status,
-            'curl_code': curl_code, 'address': address, 'detail': detail}
+def _result(domain, status, detail, *, http_status=None, curl_code=None, address=None,
+            retry_after_seconds=None):
+    result = {'domain': domain, 'status': status, 'http_status': http_status,
+              'curl_code': curl_code, 'address': address, 'detail': detail}
+    if retry_after_seconds is not None:
+        result['retry_after_seconds'] = retry_after_seconds
+    return result
 
 
 def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_RESOLVER) -> dict:
     """Check one domain without changing routing, following redirects or reading a body.
 
-    Timeout applies to each DNS/HTTPS phase. Configuration errors raise
-    ProbeError; domain-specific failures return an explicit status dictionary.
+    Timeout applies to DNS and each HTTPS attempt. A curl 92 HTTP/2 failure
+    receives one HTTP/1.1 retry at the same pinned public address. Configuration
+    errors raise ProbeError; domain-specific failures return a status dictionary.
     """
     timeout = validate_timeout(timeout)
     resolver_url = validate_resolver_url(resolver_url)
@@ -169,6 +221,9 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
         address = _public_address(domain, timeout, resolver_url)
     except _NonPublicAnswer as exc:
         return _result(domain, 'skipped', str(exc))
+    except _DNSRateLimited as exc:
+        return _result(domain, 'rate_limited', str(exc), http_status=429,
+                       curl_code=exc.curl_code, retry_after_seconds=exc.retry_after_seconds)
     except _DNSProblem as exc:
         return _result(domain, 'dns_error', str(exc))
 
@@ -180,16 +235,35 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
         '--write-out', '%{http_code}\n%{remote_ip}\n',
         '--user-agent', 'AntiZapret-Domain-Check/0.1', 'https://' + domain + '/',
     ]
+    detail_prefix = ''
     try:
-        completed = subprocess.run(command, capture_output=True, text=True,
-                                   timeout=timeout + 1, check=False, shell=False)
+        with tempfile.TemporaryDirectory(prefix='azcheck-headers-') as directory:
+            header_path = os.path.join(directory, 'headers')
+            command[-1:-1] = ['--dump-header', header_path]
+            for attempt in range(2):
+                https_command = command if not attempt else command[:2] + ['--http1.1'] + command[2:]
+                completed = subprocess.run(https_command, capture_output=True, text=True,
+                                           timeout=timeout + 1, check=False, shell=False)
+                retry_after = _read_retry_after(header_path)
+                fields = completed.stdout.splitlines()
+                if len(fields) == 2 and fields[0] == '429' and fields[1].strip() == address:
+                    return _result(domain, 'rate_limited', detail_prefix +
+                                   'HTTPS HEAD returned HTTP 429; further checks should pause.',
+                                   http_status=429, curl_code=completed.returncode, address=address,
+                                   retry_after_seconds=retry_after)
+                if not attempt and completed.returncode == 92:
+                    detail_prefix = 'HTTP/2 stream error (curl 92); retried HTTPS HEAD once with HTTP/1.1. '
+                    continue
+                break
     except subprocess.TimeoutExpired:
-        return _result(domain, 'transport_error', 'HTTPS header check timed out.', curl_code=28, address=address)
+        return _result(domain, 'transport_error', detail_prefix + 'HTTPS header check timed out.',
+                       curl_code=28, address=address)
     except OSError:
-        return _result(domain, 'transport_error', 'Could not execute curl; verify that it is installed.', curl_code=127, address=address)
+        return _result(domain, 'transport_error', detail_prefix + 'Could not execute curl; verify that it is installed.',
+                       curl_code=127, address=address)
 
     if len(completed.stdout) > 1024:
-        return _result(domain, 'transport_error', 'Unexpected output from curl.',
+        return _result(domain, 'transport_error', detail_prefix + 'Unexpected output from curl.',
                        curl_code=completed.returncode, address=address)
     fields = completed.stdout.splitlines()
     try:
@@ -197,10 +271,10 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
     except (ValueError, IndexError):
         http_status = None
     if completed.returncode:
-        return _result(domain, 'transport_error', 'HTTPS header check failed (curl ' + str(completed.returncode) + ').',
+        return _result(domain, 'transport_error', detail_prefix + 'HTTPS header check failed (curl ' + str(completed.returncode) + ').',
                        http_status=http_status or None, curl_code=completed.returncode, address=address)
     if len(fields) != 2 or fields[1].strip() != address or http_status is None or not 200 <= http_status <= 599:
-        return _result(domain, 'transport_error', 'curl did not confirm a valid response from the selected public address.',
+        return _result(domain, 'transport_error', detail_prefix + 'curl did not confirm a valid response from the selected public address.',
                        curl_code=completed.returncode, address=address)
     if http_status < 400:
         status = 'ok'
@@ -212,5 +286,6 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
         status = 'reachable'
     else:
         status = 'server_error'
-    return _result(domain, status, 'HTTPS HEAD returned HTTP ' + str(http_status) + '; redirects were not followed.',
-                   http_status=http_status, curl_code=completed.returncode, address=address)
+    return _result(domain, status, detail_prefix + 'HTTPS HEAD returned HTTP ' + str(http_status) + '; redirects were not followed.',
+                   http_status=http_status, curl_code=completed.returncode, address=address,
+                   retry_after_seconds=retry_after if status == 'rate_limited' else None)

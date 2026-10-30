@@ -259,6 +259,71 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual([entry.domain for entry in inventory.entries], ['login.example.com'])
         self.assertTrue(any(path.as_posix() in warning and '2 unsupported RPZ' in warning for warning in inventory.warnings))
 
+    def test_rpz_tld_rules_cover_children_without_becoming_probe_targets(self):
+        self.write('result/include-hosts.txt', '')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('result/proxy.rpz', ''.join(
+            f'{suffix} CNAME .\n*.{suffix} CNAME .\n'
+            for suffix in ('goog', 'google', 'ua', 'рф')
+        ))
+        self.write('result/warp.rpz', ('goog CNAME .\n*.goog CNAME .\n'
+                                       'private.goog CNAME rpz-passthru.\n'))
+        self.write('download/bol-van-domain.txt', (
+            'service.goog\nprivate.goog\nservice.google\nservice.ua\n'
+            'пример.рф\nunrouted.example\n'
+        ))
+        inventory = load_inventory(self.az, [], [])
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {
+            'service.goog', 'private.goog', 'service.google', 'service.ua',
+            'xn--e1afmkfd.xn--p1ai',
+        })
+        self.assertTrue(entries['service.goog'].included)
+        self.assertTrue(entries['private.goog'].included)
+        self.assertTrue(entries['private.goog'].excluded)
+        self.assertFalse(entries['service.google'].included)
+        self.assertFalse(any('unsupported RPZ' in warning for warning in inventory.warnings))
+
+    def test_rpz_single_label_origins_resolve_relative_and_absolute_owners(self):
+        self.write('result/include-hosts.txt', '')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('result/proxy.rpz', (
+            '$ORIGIN google.\n@ CNAME .\n* CNAME .\n'
+            'login CNAME .\ndirect CNAME rpz-passthru.\n'
+            'ua. CNAME .\n*.ua. CNAME .\n'
+        ))
+        self.write('result/warp.rpz', (
+            '$ORIGIN goog.\n@ CNAME .\n* CNAME .\n'
+            'login CNAME .\nprivate CNAME rpz-passthru.\n'
+        ))
+        self.write('download/bol-van-domain.txt', (
+            'child.google\ndirect.google\nchild.goog\nprivate.goog\nsite.ua\n'
+        ))
+        inventory = load_inventory(self.az, [], [])
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {
+            'login.google', 'child.google', 'login.goog', 'child.goog', 'site.ua',
+        })
+        self.assertTrue(entries['login.goog'].included)
+        self.assertTrue(entries['child.goog'].included)
+        self.assertFalse(entries['child.google'].included)
+        self.assertFalse(any('unsupported RPZ' in warning for warning in inventory.warnings))
+
+    def test_rpz_tld_support_keeps_invalid_rules_and_user_domains_rejected(self):
+        self.write('result/include-hosts.txt', '')
+        self.write('result/include-warp-hosts.txt', '')
+        path = self.write('result/proxy.rpz', (
+            '123 CNAME .\n*.123 CNAME .\nbad_name CNAME .\n'
+            '$ORIGIN 123.\nvalid.example CNAME .\n'
+        ))
+        inventory = load_inventory(self.az, [], [])
+        self.assertEqual([entry.domain for entry in inventory.entries], ['valid.example'])
+        self.assertTrue(any(path.as_posix() in warning and '4 unsupported RPZ' in warning
+                            for warning in inventory.warnings))
+        for value in ('goog', 'google', 'ua', 'рф'):
+            with self.subTest(value=value), self.assertRaises(DomainError):
+                load_inventory(self.az, [], [value])
+
     def test_catchall_rpz_and_cidr_routes_warn_about_finite_inventory(self):
         self.write('result/include-hosts.txt', '')
         self.write('result/include-warp-hosts.txt', '')
