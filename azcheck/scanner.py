@@ -56,18 +56,39 @@ class _Pacer:
 
 def scan_inventory(inventory, *, attempts=2, workers=2, interval_seconds=0.5,
                    timeout_seconds=8.0, resolver_url='https://1.1.1.1/dns-query',
-                   probe_fn=check_domain, progress=None, retry_delay_seconds=1.0):
-    """Bound the number of pending tasks, including when scanning large lists."""
-    pacer = _Pacer(interval_seconds)
+                   probe_fn=check_domain, progress=None, retry_delay_seconds=1.0,
+                   event=None):
+    """Bound pending tasks and emit serialized start/result events per attempt.
 
-    def scan_one(entry):
+    ``progress`` remains a completed-domain counter. ``event`` receives the
+    domain's input index and total, attempt number, and result with elapsed time.
+    Callbacks are optional; the scanner itself does not write terminal output.
+    """
+    pacer = _Pacer(interval_seconds)
+    event_lock = threading.Lock()
+    total = len(inventory.entries)
+
+    def notify(payload):
+        if event is not None:
+            with event_lock:
+                event(payload)
+
+    def scan_one(index, entry):
         probes = []
         for attempt in range(attempts):
             if attempt and retry_delay_seconds:
                 time.sleep(retry_delay_seconds)
             pacer.wait()
-            probe = probe_fn(entry.domain, timeout=timeout_seconds, resolver_url=resolver_url)
+            context = {'domain': entry.domain, 'index': index, 'total': total,
+                       'attempt': attempt + 1, 'attempts': attempts}
+            notify({**context, 'type': 'start'})
+            started = time.monotonic()
+            probe = dict(probe_fn(entry.domain, timeout=timeout_seconds, resolver_url=resolver_url))
+            elapsed = round(max(0.0, time.monotonic() - started), 3)
+            probe['elapsed_seconds'] = elapsed
             probes.append(probe)
+            notify({**context, 'type': 'result', 'result': dict(probe),
+                    'elapsed_seconds': elapsed})
             if not _possible_route_problem(probe):
                 break
         decision, reason = classify(entry, probes)
@@ -75,23 +96,23 @@ def scan_inventory(inventory, *, attempts=2, workers=2, interval_seconds=0.5,
                 'warp_included': entry.included, 'warp_excluded': entry.excluded,
                 'decision': decision, 'reason': reason, 'checks': probes}
 
-    entries = iter(inventory.entries)
+    entries = iter(enumerate(inventory.entries, 1))
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = set()
         for _ in range(workers):
             entry = next(entries, None)
             if entry is not None:
-                pending.add(pool.submit(scan_one, entry))
+                pending.add(pool.submit(scan_one, *entry))
         while pending:
             complete, pending = wait(pending, return_when=FIRST_COMPLETED)
             for future in complete:
                 results.append(future.result())
                 if progress is not None:
-                    progress(len(results), len(inventory.entries))
+                    progress(len(results), total)
                 entry = next(entries, None)
                 if entry is not None:
-                    pending.add(pool.submit(scan_one, entry))
+                    pending.add(pool.submit(scan_one, *entry))
     return sorted(results, key=lambda item: item['domain'])
 
 
@@ -151,6 +172,7 @@ def write_reports(report_dir, inventory, results):
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
     report = {'version': __version__, 'generated_at': stamp,
               'scope': 'Client VPS only; public IPv4 DNS and HTTPS HEAD on port 443.',
+              'inventory': dict(inventory.metadata),
               'donor_tested': False, 'counts': counts, 'warnings': list(inventory.warnings),
               'results': results}
     lines = [f'AntiZapret Domain Check {__version__} — {stamp}', report['scope'],
@@ -167,6 +189,19 @@ def write_reports(report_dir, inventory, results):
             for check in result['checks'])
         lines.extend([f"[{result['decision']}] {result['domain']}: {checks}",
                       '  ' + result['reason'], '  Source: ' + ', '.join(result['sources'])])
+        for attempt, check in enumerate(result['checks'], 1):
+            details = [f"Attempt {attempt}: {check['status']}"]
+            if check.get('http_status'):
+                details.append('HTTP ' + str(check['http_status']))
+            if check.get('curl_code') is not None:
+                details.append('curl ' + str(check['curl_code']))
+            if check.get('address'):
+                details.append('IP ' + str(check['address']))
+            if check.get('elapsed_seconds') is not None:
+                details.append(f"{check['elapsed_seconds']:.3f}s")
+            lines.append('  ' + ' | '.join(details))
+            if check.get('detail'):
+                lines.append('    ' + str(check['detail']))
     suggestions = ['# Tentative candidates from client-VPS checks only.',
                    '# Donor access is unverified. Review failures and test before adding.',
                    '# No AntiZapret file was changed. Generated: ' + stamp]

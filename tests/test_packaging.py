@@ -74,6 +74,39 @@ class PackagingTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(json.loads(match.group(1)), DEFAULTS)
 
+    def test_upgrade_migrates_old_defaults_and_preserves_backup_and_custom_settings(self):
+        template = (ROOT / 'tools/install.template.sh').read_text(encoding='utf-8')
+        match = re.search(r"<<'MIGRATE_CONFIG_PY'\n(.*?)\nMIGRATE_CONFIG_PY", template, re.S)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            original = b'{"report_dir":"/var/lib/antizapret-domain-check/reports","include_download":false,"timeout_seconds":12}\n'
+            config.write_bytes(original)
+
+            def migrate():
+                return subprocess.run([sys.executable, '-I', '-', str(config), str(ROOT)],
+                                      input=match.group(1), capture_output=True, text=True, timeout=10)
+
+            result = migrate()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            settings = json.loads(config.read_text())
+            self.assertEqual(settings['config_version'], 2)
+            self.assertEqual(settings['report_dir'], '/root/antizapret-domain-check/reports')
+            self.assertTrue(settings['include_download'])
+            self.assertEqual(settings['timeout_seconds'], 12)
+            backups = list(config.parent.glob('config.json.before-v0.2.*.bak'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+            before = config.read_bytes()
+            self.assertEqual(migrate().returncode, 0)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertEqual(len(list(config.parent.glob('config.json.before-v0.2.*.bak'))), 1)
+            config.write_text('{"report_dir":"/root/custom-reports","workers":3}')
+            self.assertEqual(migrate().returncode, 0)
+            settings = json.loads(config.read_text())
+            self.assertEqual(settings['report_dir'], '/root/custom-reports')
+            self.assertEqual(settings['workers'], 3)
+
     def test_daily_units_point_to_an_accepted_installed_command(self):
         from azcheck.cli import parser
 

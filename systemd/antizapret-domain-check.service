@@ -12,5 +12,3 @@ IOSchedulingClass=idle
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
-StateDirectory=antizapret-domain-check
-StateDirectoryMode=0700

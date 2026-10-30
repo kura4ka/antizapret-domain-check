@@ -3,11 +3,11 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=0.1.0
+VERSION=0.2.0
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
-STATE_DIR=/var/lib/antizapret-domain-check
+STATE_DIR=/root/antizapret-domain-check
 UNIT_DIR=/etc/systemd/system
 SERVICE=antizapret-domain-check.service
 TIMER=antizapret-domain-check.timer
@@ -111,17 +111,56 @@ WRAPPER_SH
     if [[ ! -e $CONFIG_DIR/config.json ]]; then
         cat > "$stage/config.json" <<'CONFIG_JSON'
 {
+  "config_version": 2,
   "antizapret_dir": "/root/antizapret",
-  "report_dir": "/var/lib/antizapret-domain-check/reports",
+  "report_dir": "/root/antizapret-domain-check/reports",
   "timeout_seconds": 8,
   "attempts": 2,
   "workers": 2,
   "interval_seconds": 0.5,
-  "include_download": false,
+  "include_download": true,
   "resolver_url": "https://1.1.1.1/dns-query"
 }
 CONFIG_JSON
         install -m 0600 "$stage/config.json" "$CONFIG_DIR/config.json"
+    else
+        /usr/bin/python3 -I - "$CONFIG_DIR/config.json" "$PROGRAM_DIR" <<'MIGRATE_CONFIG_PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, sys.argv[2])
+from azcheck.cli import _pairs, migrate_config
+
+config_path = Path(sys.argv[1])
+if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_size > 1024 * 1024:
+    sys.exit('Existing configuration must be a regular file smaller than 1 MiB.')
+original = config_path.read_bytes()
+document = json.loads(original.decode('utf-8'), object_pairs_hook=_pairs)
+upgraded = migrate_config(document)
+if upgraded != document:
+    descriptor, backup_name = tempfile.mkstemp(prefix='config.json.before-v0.2.', suffix='.bak', dir=str(config_path.parent))
+    with os.fdopen(descriptor, 'wb') as backup:
+        os.chmod(backup_name, 0o600)
+        backup.write(original)
+        backup.flush()
+        os.fsync(backup.fileno())
+    descriptor, temporary = tempfile.mkstemp(prefix='.config.json.', dir=str(config_path.parent))
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='\n') as output:
+            os.chmod(temporary, 0o600)
+            json.dump(upgraded, output, indent=2)
+            output.write('\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, config_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print('[antizapret-domain-check] Updated old scope/report defaults; previous config saved at ' + backup_name)
+MIGRATE_CONFIG_PY
     fi
     install -d -m 0755 "$UNIT_DIR"
     [[ ! -L $UNIT_DIR/$SERVICE && ! -L $UNIT_DIR/$TIMER ]] || die 'An existing unit path is a symbolic link; resolve it before installing units.'
@@ -137,8 +176,9 @@ CONFIG_JSON
     log "Installed v$VERSION on this client VPS. Existing configuration and reports are preserved."
     log 'Check the inventory: antizapret-domain-check inventory'
     log 'Run a check now: antizapret-domain-check scan'
-    log 'Report: /var/lib/antizapret-domain-check/reports/latest.txt'
-    log 'Review candidates: /var/lib/antizapret-domain-check/reports/suggested-include-warp-hosts.txt'
+    log 'Default report: /root/antizapret-domain-check/reports/latest.txt'
+    log 'Default candidates: /root/antizapret-domain-check/reports/suggested-include-warp-hosts.txt'
+    log 'Custom report_dir settings are preserved. Historical reports in /var/lib are left in place.'
     log 'Suggestions are tentative. Add only confirmed domains to /root/antizapret/config/include-warp-hosts.txt, then run /root/antizapret/parse.sh.'
 )
 

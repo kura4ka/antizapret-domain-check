@@ -143,6 +143,61 @@ class CLITests(unittest.TestCase):
                     self.assertIn('ERROR:', error)
                     scan.assert_not_called()
 
+    def test_old_configuration_uses_full_inventory_and_new_report_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            original = {'report_dir': cli.LEGACY_REPORT_DIR, 'include_download': False,
+                        'timeout_seconds': 12, 'workers': 3}
+            config.write_text(json.dumps(original))
+            args = cli.parser().parse_args(['scan', '--config', str(config)])
+            settings = cli.load_settings(args)
+            self.assertEqual(settings['report_dir'], '/root/antizapret-domain-check/reports')
+            self.assertTrue(settings['include_download'])
+            self.assertEqual(settings['timeout_seconds'], 12)
+            self.assertEqual(settings['workers'], 3)
+            self.assertEqual(json.loads(config.read_text()), original, 'Runtime migration must be read-only')
+            config.write_text(json.dumps({'config_version': 2, 'include_download': False, 'report_dir': directory}))
+            args = cli.parser().parse_args(['scan', '--config', str(config), '--az-dir', str(Path(directory) / 'native')])
+            settings = cli.load_settings(args)
+            self.assertFalse(settings['include_download'])
+            self.assertEqual(settings['report_dir'], directory)
+
+    def test_full_inventory_and_live_query_response_are_default_with_quiet_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            az = root / 'antizapret'
+            (az / 'config').mkdir(parents=True)
+            (az / 'download').mkdir()
+            (az / 'result').mkdir()
+            (az / 'config/include-hosts.txt').write_text('user.example\n')
+            (az / 'result/include-hosts.txt').write_text('upstream.example\n')
+            (az / 'result/include-warp-hosts.txt').write_text('')
+            (az / 'download/bol-van-domain.txt').write_text('child.upstream.example\n')
+            calls = []
+
+            def synthetic_scan(inventory, **options):
+                calls.append(inventory)
+                return scan_inventory(inventory, probe_fn=lambda domain, **kw: outcome(domain=domain),
+                                      interval_seconds=0, retry_delay_seconds=0,
+                                      event=options.get('event'), progress=options.get('progress'))
+
+            arguments = ['scan', '--az-dir', str(az), '--report-dir', str(root / 'reports')]
+            with patch('azcheck.cli.scan_inventory', side_effect=synthetic_scan), patch('azcheck.cli.shutil.which', return_value='curl'):
+                code, output, error = self.run_cli(arguments)
+                self.assertEqual(code, 0, error)
+                self.assertEqual([entry.domain for entry in calls[-1].entries],
+                                 ['child.upstream.example', 'upstream.example', 'user.example'])
+                self.assertIn('child.upstream.example attempt 1/2 QUERY', error)
+                self.assertIn('child.upstream.example attempt 1/2 RESPONSE ok | HTTP 200 | curl 0 | IP', error)
+                self.assertIn('Synthetic test result', error)
+                self.assertIn('Checked 3 domains', output)
+                code, output, error = self.run_cli(arguments + ['--quiet'])
+                self.assertEqual(code, 0, error)
+                self.assertEqual(output + error, '')
+            saved = json.loads((root / 'reports/latest.json').read_text())
+            self.assertTrue(saved['inventory']['include_download'])
+            self.assertEqual(len(saved['inventory']['registry_files']), 1)
+
     def test_empty_or_missing_inventory_does_not_produce_successful_empty_report(self):
         with tempfile.TemporaryDirectory() as directory:
             code, _, error = self.run_cli(['scan', '--az-dir', str(Path(directory) / 'antizapret'),
