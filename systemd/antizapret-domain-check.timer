@@ -1,0 +1,11 @@
+[Unit]
+Description=Run one AntiZapret domain accessibility scan each day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=antizapret-domain-check.service
+
+[Install]
+WantedBy=timers.target

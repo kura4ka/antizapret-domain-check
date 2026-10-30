@@ -1,0 +1,16 @@
+[Unit]
+Description=Check AntiZapret domain accessibility and report routing candidates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/antizapret-domain-check scan --quiet
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+StateDirectory=antizapret-domain-check
+StateDirectoryMode=0700

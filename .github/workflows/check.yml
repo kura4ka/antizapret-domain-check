@@ -1,0 +1,19 @@
+name: Check domain checker
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Verify standalone installer matches sources
+        run: python3 tools/build.py --check
+      - name: Check Bash syntax
+        run: bash -n install.sh
+      - name: Lint installer
+        run: shellcheck -S warning install.sh
