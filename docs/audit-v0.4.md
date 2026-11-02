@@ -136,3 +136,7 @@ Defaults retain 500-domain stages and five-minute pauses, add pacing for individ
 ## Performance option added in 0.5
 
 The 0.4 full matrix remains available with `--dns-checks all`. `scan --fast` uses native/reference DNS only, up to 128 workers, no artificial domain/DNS pacing, 5000-domain stages, and no inter-stage pauses. It preserves the full selected inventory and reports skipped direct diagnostics. For the observed 627,432-name inventory, checker DNS calls drop from 8,156,616 to 627,432 before retries; the 23.6-day artificial pacing floor disappears. Runtime depends on observed throughput, timeouts, retries and VPS resources. TLS certificate and public-IP checks remain enabled. `scan --fast --retry-failed` requeues saved candidate/inconclusive outcomes while retaining successful checks and honoring saved cooldowns. See the [current guide](../README.md#fast-scan-for-large-inventories) for usage and resume behavior.
+
+## Site-rate-limit correction in 0.5.1
+
+Earlier versions paused the entire inventory after any HTTP 429. Version 0.5.1 records HTTPS-origin limits separately, saves the affected domain's cooldown and continues unrelated checks. Shared explicit-DoH/unknown limits retain a global pause. A proven old native/explicit HTTPS429 pause is migrated to origin cooldowns without discarding cached results or changing the probe context. `--retry-failed` respects those deadlines. TLS verification, destination validation and Retry-After handling remain enabled.

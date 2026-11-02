@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -11,11 +12,11 @@ import sqlite3
 import time
 import uuid
 
-from .domains import InventoryEntry
+from .domains import InventoryEntry, normalize_domain
 from .scanner import classify
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CURRENT_DECISION = ("CASE WHEN targets.excluded = 1 THEN 'excluded' "
                     "WHEN targets.included = 1 THEN 'already_warp' "
                     "ELSE results.base_decision END")
@@ -117,10 +118,14 @@ class ScanCheckpoint:
                             result_json TEXT NOT NULL
                         );
                         CREATE INDEX results_decision ON results (base_decision, domain);
-                        PRAGMA user_version = 2;
+                        CREATE TABLE origin_cooldowns (
+                            domain TEXT PRIMARY KEY,
+                            not_before REAL NOT NULL CHECK (not_before >= 0)
+                        );
+                        PRAGMA user_version = 3;
                     ''')
-            elif version == 1 and tables == {'state', 'targets', 'results'}:
-                # Validate the published v0.3 schema before changing it. Schema
+            elif version in (1, 2) and tables == {'state', 'targets', 'results'}:
+                # Validate the published layouts before changing them. Schema
                 # changes share one explicit transaction so failure rolls back.
                 self._connection.execute('''
                     SELECT singleton, run_id, started_at, completed, batch_index,
@@ -128,20 +133,31 @@ class ScanCheckpoint:
                 ''')
                 self._connection.execute('SELECT domain, sources_json, included, excluded FROM targets LIMIT 0')
                 self._connection.execute('SELECT domain, base_decision, base_reason, result_json FROM results LIMIT 0')
+                if version == 2:
+                    self._connection.execute('SELECT probe_context_json, probe_context_sha256 FROM state LIMIT 0')
+                    self._state()
                 self._connection.execute('BEGIN IMMEDIATE')
                 try:
-                    self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_json TEXT NOT NULL DEFAULT ''")
-                    self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_sha256 TEXT NOT NULL DEFAULT ''")
-                    self._connection.execute('PRAGMA user_version = 2')
+                    if version == 1:
+                        self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_json TEXT NOT NULL DEFAULT ''")
+                        self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_sha256 TEXT NOT NULL DEFAULT ''")
+                    self._connection.execute('''
+                        CREATE TABLE origin_cooldowns (
+                            domain TEXT PRIMARY KEY,
+                            not_before REAL NOT NULL CHECK (not_before >= 0)
+                        )
+                    ''')
+                    self._connection.execute('PRAGMA user_version = 3')
                     self._connection.commit()
                 except BaseException:
                     self._connection.rollback()
                     raise
-            elif version != SCHEMA_VERSION or tables != {'state', 'targets', 'results'}:
+            elif version != SCHEMA_VERSION or tables != {'state', 'targets', 'results', 'origin_cooldowns'}:
                 raise RuntimeError('Checkpoint has an unsupported or incomplete database schema: ' + str(self.path))
             # Detect missing columns or state instead of recreating a broken store.
             self._connection.execute('SELECT domain, sources_json, included, excluded FROM targets LIMIT 0')
             self._connection.execute('SELECT domain, base_decision, base_reason, result_json FROM results LIMIT 0')
+            self._connection.execute('SELECT domain, not_before FROM origin_cooldowns LIMIT 0')
             self._state()
         except (sqlite3.Error, OSError) as exc:
             self.close()
@@ -262,7 +278,11 @@ class ScanCheckpoint:
                     DELETE FROM results
                     WHERE base_decision IN ('candidate', 'inconclusive')
                       AND EXISTS (SELECT 1 FROM targets WHERE targets.domain = results.domain)
-                ''').rowcount
+                      AND NOT EXISTS (
+                          SELECT 1 FROM origin_cooldowns
+                          WHERE origin_cooldowns.domain = results.domain AND not_before > ?
+                      )
+                ''', (time.time(),)).rowcount
                 missing = requeued_count or connection.execute('''
                     SELECT 1 FROM targets LEFT JOIN results USING (domain)
                     WHERE results.domain IS NULL LIMIT 1
@@ -404,6 +424,94 @@ class ScanCheckpoint:
 
     def pause_remaining(self):
         return max(0.0, self._state()['pause_until'] - time.time())
+
+    def origin_cooldowns(self):
+        """Return active per-domain deadlines, independent of the current run."""
+        with self._transaction('read origin cooldowns from') as connection:
+            rows = connection.execute('''
+                SELECT domain, not_before FROM origin_cooldowns WHERE not_before > ?
+            ''', (time.time(),))
+            active = {}
+            for domain, deadline in rows:
+                if (not isinstance(domain, str) or normalize_domain(domain) != domain
+                        or not isinstance(deadline, (int, float)) or not math.isfinite(deadline)):
+                    raise RuntimeError('Scan checkpoint contains an invalid origin cooldown.')
+                active[domain] = float(deadline)
+        return active
+
+    def defer_origin(self, domain, seconds):
+        """Persist an origin's cooldown without shortening an existing deadline."""
+        domain = normalize_domain(domain)
+        try:
+            valid = (not isinstance(seconds, bool) and isinstance(seconds, (int, float))
+                     and math.isfinite(seconds) and seconds >= 0)
+            deadline = time.time() + seconds if valid else float('nan')
+        except (TypeError, OverflowError):
+            valid, deadline = False, float('nan')
+        if not valid or not math.isfinite(deadline) or deadline < 0:
+            raise ValueError('Origin cooldown seconds must produce a finite nonnegative deadline.')
+        with self._transaction('defer an origin in') as connection:
+            connection.execute('''
+                INSERT INTO origin_cooldowns (domain, not_before) VALUES (?, ?)
+                ON CONFLICT (domain) DO UPDATE SET
+                    not_before = MAX(origin_cooldowns.not_before, excluded.not_before)
+            ''', (domain, deadline))
+            return float(connection.execute(
+                'SELECT not_before FROM origin_cooldowns WHERE domain = ?', (domain,)).fetchone()[0])
+
+    def release_legacy_origin_pause(self):
+        """Convert a proven old site HTTP-429 pause without changing saved work.
+
+        Call before ``prepare`` can delete old results. A native/numeric DNS
+        plan and a public pinned HTTPS address prove the HTTP-429 origin. DoH,
+        missing or ambiguous evidence keeps the global resolver cooldown.
+        """
+        state = self._state()
+        if state['pause_reason'] != 'HTTP 429 rate limit':
+            return False
+        context = _decode_probe_context(state['probe_context_json'], state['probe_context_sha256'])
+        dns = context.get('dns') if isinstance(context, dict) else None
+        if not isinstance(dns, dict) or dns.get('mode') not in ('antizapret', 'explicit'):
+            return False
+        origins = []
+        with self._transaction('read legacy rate limits from') as connection:
+            rows = connection.execute('''
+                SELECT domain, result_json FROM results WHERE base_decision = 'inconclusive'
+            ''')
+            for domain, encoded in rows:
+                try:
+                    document = json.loads(encoded)
+                    if (not isinstance(document, dict) or document.get('domain') != domain
+                            or not isinstance(document.get('checks'), list)):
+                        return False
+                    matching = False
+                    for probe in document['checks']:
+                        if not isinstance(probe, dict):
+                            return False
+                        if probe.get('http_status') != 429 and probe.get('status') != 'rate_limited':
+                            continue
+                        address = ipaddress.IPv4Address(probe.get('address'))
+                        if (not address.is_global or address.is_multicast
+                                or probe.get('dns_mode') not in (None, 'antizapret', 'explicit')
+                                or probe.get('rate_limit_scope') not in (None, 'origin')):
+                            return False
+                        matching = True
+                    if matching:
+                        if normalize_domain(domain) != domain:
+                            return False
+                        origins.append(domain)
+                except (ValueError, TypeError, OverflowError):
+                    return False
+        if not origins:
+            return False
+        with self._transaction('convert a legacy origin pause in') as connection:
+            connection.executemany('''
+                INSERT INTO origin_cooldowns (domain, not_before) VALUES (?, ?)
+                ON CONFLICT (domain) DO UPDATE SET
+                    not_before = MAX(origin_cooldowns.not_before, excluded.not_before)
+            ''', ((domain, state['pause_until']) for domain in origins))
+            connection.execute("UPDATE state SET pause_until = 0, pause_reason = '' WHERE singleton = 1")
+        return True
 
     def info(self):
         state = self._state()

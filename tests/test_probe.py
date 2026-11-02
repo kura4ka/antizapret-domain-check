@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from azcheck import probe
+from azcheck.resolvers import parse_resolver
 
 
 def dns_answer(*addresses):
@@ -66,6 +67,10 @@ class ProbeTests(unittest.TestCase):
                 result, _ = self.run_probe(code=code)
                 self.assertEqual(result['status'], expected)
                 self.assertEqual(result['http_status'], code)
+                if code == 429:
+                    self.assertEqual(result['rate_limit_scope'], 'origin')
+                else:
+                    self.assertNotIn('rate_limit_scope', result)
 
     def test_dns_http429_stops_before_https_and_retains_retry_after(self):
         responder = header_response(dns_result(code=429, curl_code=22),
@@ -77,6 +82,8 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result['http_status'], 429)
         self.assertEqual(result['curl_code'], 22)
         self.assertEqual(result['retry_after_seconds'], 120)
+        self.assertEqual(result['rate_limit_scope'], 'resolver')
+        self.assertEqual(result['dns_mode'], 'explicit-doh')
         self.assertIn('DNS resolver', result['detail'])
         command = run.call_args.args[0]
         self.assertFalse(Path(command[command.index('--dump-header') + 1]).exists())
@@ -100,7 +107,10 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 3 if initial_error else 2)
                 self.assertEqual(result['status'], 'rate_limited')
                 self.assertEqual(result['retry_after_seconds'], 3600)
+                self.assertEqual(result['rate_limit_scope'], 'origin')
+                self.assertEqual(result['dns_mode'], 'explicit-doh', 'Legacy DNS metadata must preserve HTTPS origin scope.')
                 self.assertIn('HTTP 429', result['detail'])
+                self.assertIn('only this domain should pause', result['detail'])
                 if initial_error:
                     self.assertIn('HTTP/1.1', result['detail'])
 
@@ -111,6 +121,26 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertEqual(result['status'], 'rate_limited')
         self.assertEqual(result['curl_code'], 92)
+        self.assertEqual(result['rate_limit_scope'], 'origin')
+
+    def test_native_reference_https429_retains_origin_scope_and_retry_after(self):
+        reference = parse_resolver('udp://127.3.3.3:53', allow_loopback=True)
+        reference['role'] = 'reference'
+        plan = {'reference': reference, 'upstreams': [], 'dns_checks': 'reference', 'mode': 'antizapret'}
+        dns_response = {'resolver': reference['id'], 'status': 'ok', 'addresses': ['93.184.215.14']}
+        limited = subprocess.CompletedProcess([], 0, '429\n93.184.215.14\n', '')
+        responder = header_response(limited, b'HTTP/2 429\r\nRetry-After: 45\r\n\r\n')
+        with patch.object(probe, 'query_resolver', return_value=dns_response) as query, \
+             patch.object(probe.subprocess, 'run', side_effect=responder) as run:
+            result = probe.check_domain('example.com', resolver_plan=plan)
+        query.assert_called_once()
+        run.assert_called_once()
+        self.assertEqual(result['status'], 'rate_limited')
+        self.assertEqual(result['http_status'], 429)
+        self.assertEqual(result['rate_limit_scope'], 'origin')
+        self.assertEqual(result['retry_after_seconds'], 45)
+        self.assertEqual(result['dns_reference'], reference['id'])
+        self.assertEqual(result['dns_mode'], 'antizapret')
 
     def test_retry_after_http_dates_final_response_and_invalid_headers(self):
         cases = (

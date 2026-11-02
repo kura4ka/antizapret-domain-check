@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-AZCHECK_VERSION=0.5.0
+AZCHECK_VERSION=0.5.1
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
@@ -185,6 +185,7 @@ MIGRATE_CONFIG_PY
     log 'Default scope: generated routing policies plus explicit user additions; raw registry expansion is opt-in.'
     log 'Default DNS: discover AntiZapret real-answer resolver and selected upstreams. Unknown configurations require explicit DNS overrides.'
     log 'Faster scan: antizapret-domain-check scan --fast (native/reference DNS only, 128 workers, no artificial delays or stage pauses).'
+    log 'A site HTTP 429 defers only that domain; unrelated domains continue. Shared DNS-service limits still pause the scan.'
     log 'Recheck saved failures with matching options: antizapret-domain-check scan --fast --retry-failed'
     log 'Full upstream comparison remains available: antizapret-domain-check scan --dns-checks all'
     log 'Run stages with saved progress: antizapret-domain-check scan'

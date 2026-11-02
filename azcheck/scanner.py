@@ -19,6 +19,12 @@ from .probe import check_domain
 RETRYABLE_CURL = frozenset((7, 28, 35, 52, 55, 56))
 
 
+def is_global_rate_limit(probe):
+    """Only shared/unknown infrastructure limits stop unrelated domains."""
+    limited = probe['status'] == 'rate_limited' or probe.get('http_status') == 429
+    return limited and probe.get('rate_limit_scope') != 'origin'
+
+
 def _possible_route_problem(probe):
     return probe['status'] == 'blocked' or (
         probe['status'] == 'transport_error' and probe.get('curl_code') in RETRYABLE_CURL
@@ -66,7 +72,8 @@ def scan_inventory(inventory, *, attempts=2, workers=2, interval_seconds=0.5,
     domain's input index and total, attempt number, and result with elapsed time.
     ``completed`` receives each result on the calling thread for checkpointing.
     Cancellation stops new attempts and drains in-flight results, including on
-    KeyboardInterrupt. A rate-limit response requests cancellation as well.
+    KeyboardInterrupt. Shared/unknown rate limits request cancellation; an
+    explicitly scoped HTTPS origin limit only completes that domain.
     Callbacks are optional; the scanner itself does not write terminal output.
     """
     pacer = _Pacer(interval_seconds)
@@ -97,7 +104,7 @@ def scan_inventory(inventory, *, attempts=2, workers=2, interval_seconds=0.5,
             probe = dict(probe_fn(entry.domain, timeout=timeout_seconds, resolver_url=resolver_url))
             elapsed = round(max(0.0, time.monotonic() - started), 3)
             probe['elapsed_seconds'] = elapsed
-            if probe['status'] == 'rate_limited' or probe.get('http_status') == 429:
+            if is_global_rate_limit(probe):
                 stop_event.set()
             notify({**context, 'type': 'result', 'result': dict(probe),
                     'elapsed_seconds': elapsed})

@@ -15,7 +15,7 @@ from .audit import refresh_suggestions, write_inventory_audit
 from .domains import DomainError, Inventory, load_inventory
 from .probe import ProbeError, check_domain, validate_resolver_url, validate_timeout
 from .resolvers import applicable_resolvers, discover_resolvers, parse_resolver
-from .scanner import _Pacer, report_lock, scan_inventory, write_reports
+from .scanner import _Pacer, is_global_rate_limit, report_lock, scan_inventory, write_reports
 
 
 DEFAULT_CONFIG = '/etc/antizapret-domain-check/config.json'
@@ -350,6 +350,8 @@ def main(argv=None):
         report_dir = Path(settings['report_dir'])
         dns_pacer = _Pacer(settings['dns_interval_seconds'])
         with report_lock(report_dir), ScanCheckpoint(report_dir) as checkpoint:
+            if checkpoint.release_legacy_origin_pause():
+                log('Converted a saved site HTTP-429 pause to a per-domain cooldown; unrelated domains can resume.')
             new_run = checkpoint.prepare(inventory, restart=args.restart, probe_context=probe_context,
                                          retry_failed=args.retry_failed)
             if args.retry_failed:
@@ -358,6 +360,9 @@ def main(argv=None):
             write_inventory_audit(report_dir, inventory, plan)
             if checkpoint.info().get('context_changed'):
                 log('DNS/probe configuration changed; cached checks were invalidated. Saved cooldowns still apply.')
+            origin_cooldowns = checkpoint.origin_cooldowns()
+            if origin_cooldowns:
+                log(f'{len(origin_cooldowns)} site cooldowns are active; those origins are deferred while other domains continue.')
             pending = checkpoint.pending_entries(inventory)
             initial_completed = checkpoint.completed_count()
             started = last_progress = time.monotonic()
@@ -397,7 +402,14 @@ def main(argv=None):
                 def completed(result):
                     nonlocal limited
                     saved = checkpoint.save_result(result)
-                    limits = [probe for probe in result['checks'] if probe['status'] == 'rate_limited']
+                    for check in result['checks']:
+                        if check.get('rate_limit_scope') == 'origin' and (
+                                check['status'] == 'rate_limited' or check.get('http_status') == 429):
+                            if not check.get('deferred'):
+                                delay = max(3600, check.get('retry_after_seconds') or 0)
+                                origin_cooldowns[result['domain']] = checkpoint.defer_origin(result['domain'], delay)
+                                log(f"HTTP 429 from {result['domain']}; this domain is deferred for {_duration(delay)}. Other domains continue.")
+                    limits = [probe for probe in result['checks'] if is_global_rate_limit(probe)]
                     if limits:
                         limited = True
                         delay = max([3600] + [probe.get('retry_after_seconds', 0) for probe in limits])
@@ -409,6 +421,14 @@ def main(argv=None):
                 stop_event = threading.Event()
 
                 def probe(domain, **options):
+                    deadline = origin_cooldowns.get(domain, 0)
+                    remaining = deadline - time.time()
+                    if remaining > 0:
+                        return {'domain': domain, 'status': 'rate_limited', 'http_status': None,
+                                'curl_code': None, 'address': None, 'rate_limit_scope': 'origin',
+                                'deferred': True, 'retry_not_before': deadline,
+                                'retry_after_seconds': math.ceil(remaining),
+                                'detail': 'Saved HTTP-429 origin cooldown is active; DNS/HTTPS checks were deferred.'}
                     return check_domain(domain, **options,
                                         resolver_plan=None if plan['mode'] == 'explicit-doh' else plan,
                                         dns_pacer=lambda: dns_pacer.wait(stop_event),
@@ -446,7 +466,7 @@ def main(argv=None):
                     log('Scan interrupted; completed checks are saved. Run scan again to resume after the saved cooldown.')
                     return 130
                 if limited:
-                    log('Rate limit received; scan stopped. The saved cooldown is at least one hour '
+                    log('Rate limit received; scan stopped. Shared DNS/service scope. The saved cooldown is at least one hour '
                         'and honors a longer Retry-After. Run scan later to resume.')
                     return 0
                 if args.one_batch:

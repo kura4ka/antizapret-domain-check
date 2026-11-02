@@ -250,7 +250,8 @@ class FastNativeScanTests(unittest.TestCase):
 
         def limited(domain, address, timeout):
             result = https_response(domain, address, timeout)
-            result.update(status='rate_limited', http_status=429, retry_after_seconds=7200)
+            result.update(status='rate_limited', http_status=429, retry_after_seconds=7200,
+                          rate_limit_scope='resolver')
             return result
 
         code, _, error, first_query, _ = self.invoke('--fast', '--workers', '1',

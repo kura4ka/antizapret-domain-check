@@ -2,7 +2,7 @@
 
 Check AntiZapret domain availability from the **client VPS** and produce a reviewable list of possible WARP/donor candidates. This is separate from [antizapret-relay](https://github.com/kura4ka/antizapret-relay).
 
-Version **0.5.0** adds `scan --fast` for large inventories and retains full upstream comparisons as a separate diagnostic mode. It uses generated routing lists by default, audits exactly where its domain count comes from, and discovers AntiZapret's saved DNS configuration. Checks run in resumable stages. The checker writes its own reports and checkpoint; it does not change AntiZapret routing or restart its services.
+Version **0.5.1** scopes HTTP 429 cooldowns to the affected site and retains saved progress when upgrading from 0.5.0. Version **0.5.0** adds `scan --fast` for large inventories and retains full upstream comparisons as a separate diagnostic mode. It uses generated routing lists by default, audits exactly where its domain count comes from, and discovers AntiZapret's saved DNS configuration. Checks run in resumable stages. The checker writes its own reports and checkpoint; it does not change AntiZapret routing or restart its services.
 
 ## On the client VPS
 
@@ -111,7 +111,7 @@ antizapret-domain-check scan --fast --workers 32
 antizapret-domain-check scan --fast --dns-checks all
 ```
 
-The profile does not rewrite saved settings, resolver overrides, lists, or report paths. Continue using `--fast` when resuming this mode; changing DNS comparison scope invalidates incompatible saved outcomes while retaining cooldowns and batch report history. HTTP `429` still stops the scan and saves its cooldown. Use `--quiet` if terminal output limits throughput; reports and checkpoints are still written. HTTPS certificates and public destination addresses are validated in every mode; fast mode never uses `curl -k`.
+The profile does not rewrite saved settings, resolver overrides, lists, or report paths. Continue using `--fast` when resuming this mode; changing DNS comparison scope invalidates incompatible saved outcomes while retaining cooldowns and batch report history. A site HTTP `429` saves a cooldown only for that domain and does not stop unrelated checks. A shared DNS/service limit still pauses the scan. Use `--quiet` if terminal output limits throughput; reports and checkpoints are still written. HTTPS certificates and public destination addresses are validated in every mode; fast mode never uses `curl -k`.
 
 ## Recheck saved failures
 
@@ -121,7 +121,7 @@ antizapret-domain-check scan --fast --retry-failed
 
 This requeues saved **candidate** and **inconclusive** results, including failed DNS/HTTPS checks, and retains successful checks. It uses the current routing inventory, so removed domains are not resurrected. It also continues any unfinished domains in that inventory. Repeat the original DNS, timeout, and attempt flags: changing semantic probe settings is rejected for this partial retry, rather than relabeling old successful results. Worker counts and pacing can change. `--restart` and `--retry-failed` cannot be combined.
 
-Saved HTTP-429 cooldowns still apply. The ordinary scan automatically resumes checks interrupted before completion; `--retry-failed` additionally retries failures already saved as completed. A completed scan can be partially retried without restarting every successful domain. `--retry-failed` starts a new retry sweep each time it is supplied. After Ctrl+C or `--one-batch`, resume that sweep with `scan --fast` **without** `--retry-failed`, so persistent early failures are not requeued ahead of unfinished targets again. To force a new full run with different DNS/probe settings, use `--restart`.
+Saved site HTTP-429 cooldowns still apply: cooling domains are excluded from a failed-result retry until their deadline. Shared DNS/service cooldowns still pause the whole scan. The ordinary scan automatically resumes checks interrupted before completion; `--retry-failed` additionally retries failures already saved as completed. A completed scan can be partially retried without restarting every successful domain. `--retry-failed` starts a new retry sweep each time it is supplied. After Ctrl+C or `--one-batch`, resume that sweep with `scan --fast` **without** `--retry-failed`, so persistent early failures are not requeued ahead of unfinished targets again. To force a new full run with different DNS/probe settings, use `--restart`.
 
 ## Run in stages
 
@@ -146,7 +146,11 @@ A changed DNS plan or probe context invalidates incompatible cached outcomes, in
 antizapret-domain-check scan --restart --one-batch
 ```
 
-An HTTP `429` stops the run and saves a cooldown of at least one hour, extended by a longer valid `Retry-After`. Restarting the command preserves that cooldown. Staging reduces traffic; provider usage rules still apply. Large inventories can take many days.
+A website HTTP `429` marks that domain inconclusive, saves an origin-specific cooldown of at least one hour (or a longer valid `Retry-After`), and continues with unrelated domains. No immediate retry is sent. Cooldowns survive Ctrl+C, a new run, and `--restart`; a cooling domain encountered in a new run receives an explicit deferred result without DNS/HTTPS requests. `--retry-failed` leaves saved cooling results alone until their deadline.
+
+A `429` from the shared explicit DoH resolver, or an unknown rate-limit scope, still stops the whole run and saves its global cooldown. Site limits and shared infrastructure limits are recorded separately; a site `429` is not evidence of a VPS-provider ban. No IP rotation, alternate-provider retry, or TLS bypass is used.
+
+When upgrading from 0.5.0, a saved global pause attributable to a native/explicit DNS run's HTTPS `429` with a public destination address is converted to a per-domain cooldown. Existing completed outcomes, run identity, DNS/probe context, and the original cooldown deadline are retained, allowing other domains to resume. Ambiguous legacy evidence or an explicit DoH context retains the global pause. Large inventories still depend on network latency and server responses.
 
 ## Read the reports
 
@@ -157,7 +161,7 @@ Everything below defaults to **`/root/antizapret-domain-check/reports/`**:
 | `inventory-audit.txt` | Human-readable count, source accounting, DNS discovery, warnings, and optional raw-expansion comparison |
 | `inventory-audit.json` | Full audit metadata, per-file statistics, contributions, and DNS plan/error |
 | `inventory.tsv` | Exactly the selected domain names, WARP states, and source references |
-| `checkpoint.sqlite3` | Durable outcomes, probe context, and persistent pauses |
+| `checkpoint.sqlite3` | Durable outcomes, probe context, global pauses, and per-domain HTTP-429 cooldowns |
 | `latest.txt`, `latest.json` | Latest stage details and cumulative progress while unfinished; complete run after final completion |
 | `suggested-include-warp-hosts.txt` | Cumulative tentative candidates under current rules |
 | `runs/<run-id>/batch-000001/` etc. | Stage-by-stage report history |

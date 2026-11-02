@@ -36,7 +36,7 @@ class _DNSProblem(Exception):
 
 class _DNSRateLimited(_DNSProblem):
     def __init__(self, retry_after_seconds=None, curl_code=None):
-        super().__init__('Public DNS resolver returned HTTP 429; further checks should pause.')
+        super().__init__('Public DNS resolver returned HTTP 429; checks using this resolver should pause.')
         self.retry_after_seconds = retry_after_seconds
         self.curl_code = curl_code
 
@@ -198,11 +198,13 @@ def _public_address(domain, timeout, resolver_url):
 
 
 def _result(domain, status, detail, *, http_status=None, curl_code=None, address=None,
-            retry_after_seconds=None):
+            retry_after_seconds=None, rate_limit_scope=None):
     result = {'domain': domain, 'status': status, 'http_status': http_status,
               'curl_code': curl_code, 'address': address, 'detail': detail}
     if retry_after_seconds is not None:
         result['retry_after_seconds'] = retry_after_seconds
+    if rate_limit_scope is not None:
+        result['rate_limit_scope'] = rate_limit_scope
     return result
 
 
@@ -239,7 +241,8 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
         return legacy(_result(domain, 'skipped', str(exc)))
     except _DNSRateLimited as exc:
         return legacy(_result(domain, 'rate_limited', str(exc), http_status=429,
-                              curl_code=exc.curl_code, retry_after_seconds=exc.retry_after_seconds))
+                              curl_code=exc.curl_code, retry_after_seconds=exc.retry_after_seconds,
+                              rate_limit_scope='resolver'))
     except _DNSProblem as exc:
         return legacy(_result(domain, 'dns_error', str(exc)))
 
@@ -268,9 +271,9 @@ def _https_head(domain, address, timeout):
                 fields = completed.stdout.splitlines()
                 if len(fields) == 2 and fields[0] == '429' and fields[1].strip() == address:
                     return _result(domain, 'rate_limited', detail_prefix +
-                                   'HTTPS HEAD returned HTTP 429; further checks should pause.',
+                                   'HTTPS HEAD returned HTTP 429; only this domain should pause.',
                                    http_status=429, curl_code=completed.returncode, address=address,
-                                   retry_after_seconds=retry_after)
+                                   retry_after_seconds=retry_after, rate_limit_scope='origin')
                 if not attempt and completed.returncode == 92:
                     detail_prefix = 'HTTP/2 stream error (curl 92); retried HTTPS HEAD once with HTTP/1.1. '
                     continue
@@ -308,7 +311,8 @@ def _https_head(domain, address, timeout):
         status = 'server_error'
     return _result(domain, status, detail_prefix + 'HTTPS HEAD returned HTTP ' + str(http_status) + '; redirects were not followed.',
                    http_status=http_status, curl_code=completed.returncode, address=address,
-                   retry_after_seconds=retry_after if status == 'rate_limited' else None)
+                   retry_after_seconds=retry_after if status == 'rate_limited' else None,
+                   rate_limit_scope='origin' if status == 'rate_limited' else None)
 
 
 def _check_with_resolvers(domain, timeout, plan, dns_pacer, dns_event, cancelled):

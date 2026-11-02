@@ -142,6 +142,7 @@ class CheckpointTests(unittest.TestCase):
                 INSERT INTO state SELECT singleton, run_id, started_at, completed,
                                          batch_index, pause_until, pause_reason FROM oldstate;
                 DROP TABLE oldstate;
+                DROP TABLE origin_cooldowns;
                 PRAGMA user_version = 1;
                 COMMIT;
             ''')
@@ -161,7 +162,7 @@ class CheckpointTests(unittest.TestCase):
             self.assertIsNone(store.info()['probe_context'])
             self.assertFalse(store.prepare(targets))
             with sqlite3.connect(str(store.path)) as reader:
-                self.assertEqual(reader.execute('PRAGMA user_version').fetchone()[0], 2)
+                self.assertEqual(reader.execute('PRAGMA user_version').fetchone()[0], 3)
             self.assertTrue(store.prepare(targets, probe_context={'dns': ['1.1.1.1']}))
             self.assertEqual(store.completed_count(), 0)
             with patch('azcheck.checkpoint.time.time', return_value=1100):
@@ -381,6 +382,243 @@ class CheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'DNS/probe context changed'):
                 store.prepare(targets, probe_context={'dns': ['1.1.1.1']}, retry_failed=True)
             self.assertEqual('\n'.join(store._db().iterdump()), before)
+
+    def test_origin_cooldowns_persist_normalize_and_never_shorten_deadlines(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                self.assertEqual(store.defer_origin('RATE.Example', 4000), 5000)
+                self.assertEqual(store.defer_origin('rate.example', 100), 5000)
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 5000})
+                store.defer_origin('other.example', 200)
+            with sqlite3.connect(str(store.path)) as reader:
+                self.assertEqual(reader.execute('SELECT not_before FROM origin_cooldowns WHERE domain = ?',
+                                                ('rate.example',)).fetchone()[0], 5000)
+        with ScanCheckpoint(self.report_dir) as store:
+            with patch('azcheck.checkpoint.time.time', return_value=1200):
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 5000})
+                self.assertEqual(store.defer_origin('rate.example', 5000), 6200)
+            with patch('azcheck.checkpoint.time.time', return_value=6200):
+                self.assertEqual(store.origin_cooldowns(), {})
+
+    def test_origin_cooldowns_survive_restart_context_changes_and_completed_new_runs(self):
+        targets = inventory('rate.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.prepare(targets, probe_context={'dns': 'first'})
+                store.defer_origin('rate.example', 7200)
+                store.save_result(result('rate.example'))
+                store.mark_complete()
+                self.assertTrue(store.prepare(targets, probe_context={'dns': 'first'}))
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 8200})
+                self.assertTrue(store.prepare(targets, restart=True, probe_context={'dns': 'second'}))
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 8200})
+                self.assertEqual(store.pause_remaining(), 0)
+
+    def test_origin_cooldown_validation_does_not_change_existing_deadlines(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.defer_origin('rate.example', 3600)
+                before = '\n'.join(store._db().iterdump())
+                for seconds in (-1, True, None, '20', float('inf'), float('nan'), 10 ** 1000):
+                    with self.subTest(seconds_type=type(seconds).__name__), self.assertRaises(ValueError):
+                        store.defer_origin('rate.example', seconds)
+                    self.assertEqual('\n'.join(store._db().iterdump()), before)
+                for domain in ('localhost', '1.1.1.1', '', 'broken..example'):
+                    with self.subTest(domain=domain), self.assertRaises(ValueError):
+                        store.defer_origin(domain, 3600)
+                    self.assertEqual('\n'.join(store._db().iterdump()), before)
+
+    def test_retry_failed_keeps_origin_cooled_results_and_requeues_them_after_expiry(self):
+        targets = inventory('rate.example', 'retry.example', 'ok.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets)
+            rate = result('rate.example')
+            rate['checks'] = [{'status': 'rate_limited', 'http_status': 429, 'address': '93.184.215.14'}]
+            saved = store.save_result(rate)
+            store.save_result(result('retry.example', 'candidate'))
+            store.save_result(result('ok.example'))
+            store.mark_complete()
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.defer_origin('rate.example', 3600)
+                self.assertFalse(store.prepare(targets, retry_failed=True))
+                self.assertEqual(store.info()['requeued_count'], 1)
+                self.assertEqual([entry.domain for entry in store.pending_entries(targets)], ['retry.example'])
+                self.assertEqual(next(row for row in store.iter_results() if row['domain'] == 'rate.example'), saved)
+                store.save_result(result('retry.example'))
+                store.mark_complete()
+                self.assertFalse(store.prepare(targets, retry_failed=True))
+                self.assertEqual(store.info()['requeued_count'], 0)
+                self.assertTrue(store.info()['completed'])
+                self.assertEqual(store.pending_entries(targets), [])
+            with patch('azcheck.checkpoint.time.time', return_value=4600):
+                self.assertFalse(store.prepare(targets, retry_failed=True))
+                self.assertEqual(store.info()['requeued_count'], 1)
+                self.assertFalse(store.info()['completed'])
+                self.assertEqual([entry.domain for entry in store.pending_entries(targets)], ['rate.example'])
+
+    def test_schema_two_migration_preserves_saved_run_and_global_pause(self):
+        targets = inventory('one.example', 'two.example')
+        context = {'dns': {'mode': 'antizapret'}, 'attempts': 2}
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context=context)
+            saved = store.save_result(result('one.example'))
+            store.finish_batch()
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(7200, 'HTTP 429 rate limit')
+            initial = store.info()
+        path = self.report_dir / 'checkpoint.sqlite3'
+        with sqlite3.connect(str(path)) as connection:
+            connection.execute('DROP TABLE origin_cooldowns')
+            connection.execute('PRAGMA user_version = 2')
+        with ScanCheckpoint(self.report_dir) as store:
+            current = store.info()
+            for key in ('run_id', 'started_at', 'batch_index', 'pause_until', 'pause_reason',
+                        'probe_context', 'probe_context_sha256', 'completed_count'):
+                self.assertEqual(current[key], initial[key])
+            self.assertEqual(list(store.iter_results()), [saved])
+            self.assertEqual(store.origin_cooldowns(), {})
+            self.assertEqual(store._db().execute('PRAGMA user_version').fetchone()[0], 3)
+
+    def test_schema_two_failed_origin_table_creation_rolls_back_migration(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('one.example'), probe_context={'dns': {'mode': 'antizapret'}})
+            store.save_result(result('one.example'))
+        path = self.report_dir / 'checkpoint.sqlite3'
+        with sqlite3.connect(str(path)) as connection:
+            connection.execute('DROP TABLE origin_cooldowns')
+            connection.execute('CREATE INDEX origin_cooldowns ON results (domain)')
+            connection.execute('PRAGMA user_version = 2')
+            before = '\n'.join(connection.iterdump())
+        with self.assertRaisesRegex(RuntimeError, 'checkpoint'):
+            ScanCheckpoint(self.report_dir)
+        with sqlite3.connect(str(path)) as connection:
+            self.assertEqual('\n'.join(connection.iterdump()), before)
+            self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 2)
+
+    def test_legacy_native_global_pause_converts_atomically_without_resetting_saved_work(self):
+        targets = inventory('rate.example', 'also-rate.example', 'ok.example', 'pending.example')
+        context = {'dns': {'mode': 'antizapret', 'dns_checks': 'reference'}, 'timeout_seconds': 8, 'attempts': 2}
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context=context)
+            for domain in ('rate.example', 'also-rate.example'):
+                document = result(domain)
+                document['checks'] = [{'status': 'rate_limited', 'http_status': 429,
+                                       'address': '93.184.215.14', 'dns_mode': 'antizapret'}]
+                store.save_result(document)
+            store.save_result(result('ok.example'))
+            store.finish_batch()
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(7200, 'HTTP 429 rate limit')
+                store.defer_origin('rate.example', 9000)
+                previous = store.info()
+                saved_rows = list(store._db().execute('SELECT * FROM results ORDER BY domain'))
+                self.assertTrue(store.release_legacy_origin_pause())
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 10000, 'also-rate.example': 8200})
+                self.assertEqual(store.pause_remaining(), 0)
+                self.assertFalse(store.release_legacy_origin_pause())
+                current = store.info()
+            for key in ('run_id', 'started_at', 'batch_index', 'probe_context',
+                        'probe_context_sha256', 'completed_count', 'completed'):
+                self.assertEqual(current[key], previous[key])
+            self.assertEqual(list(store._db().execute('SELECT * FROM results ORDER BY domain')), saved_rows)
+            self.assertEqual(current['pause_until'], 0)
+            self.assertEqual(current['pause_reason'], '')
+            with patch('azcheck.checkpoint.time.time', return_value=1100):
+                self.assertFalse(store.prepare(targets, probe_context=context))
+                self.assertEqual([entry.domain for entry in store.pending_entries(targets)], ['pending.example'])
+                self.assertEqual(store.completed_count(), 3)
+
+    def test_legacy_conversion_only_parses_inconclusive_subset_and_supports_explicit_dns(self):
+        targets = inventory('rate.example', 'ok.example', 'blocked.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context={'dns': {'mode': 'explicit'}})
+            document = result('rate.example')
+            document['checks'] = [{'status': 'rate_limited', 'http_status': 429, 'address': '8.8.8.8'}]
+            store.save_result(document)
+            store.save_result(result('ok.example'))
+            store.save_result(result('blocked.example', 'candidate'))
+            with store._db() as connection:
+                connection.execute("UPDATE results SET result_json = '{broken' WHERE base_decision != 'inconclusive'")
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(3600, 'HTTP 429 rate limit')
+                self.assertTrue(store.release_legacy_origin_pause())
+                self.assertEqual(store.origin_cooldowns(), {'rate.example': 4600})
+
+    def test_legacy_conversion_refuses_unknown_doh_or_ambiguous_429_evidence_without_writes(self):
+        cases = [
+            (None, {'address': '93.184.215.14'}),
+            ({'dns': {'mode': 'explicit-doh'}}, {'address': '93.184.215.14'}),
+            ({'dns': {'mode': 'unknown'}}, {'address': '93.184.215.14'}),
+            ({'dns': {'mode': 'antizapret'}}, {}),
+            ({'dns': {'mode': 'antizapret'}}, {'address': '127.0.0.1'}),
+            ({'dns': {'mode': 'antizapret'}}, {'address': '100.64.1.2'}),
+            ({'dns': {'mode': 'antizapret'}}, {'address': '93.184.215.14', 'dns_mode': 'explicit-doh'}),
+            ({'dns': {'mode': 'explicit'}}, {'address': '93.184.215.14', 'rate_limit_scope': 'resolver'}),
+        ]
+        with ScanCheckpoint(self.report_dir) as store:
+            for context, extra in cases:
+                with self.subTest(context=context, extra=extra):
+                    targets = inventory('rate.example')
+                    store.prepare(targets, restart=True, probe_context=context)
+                    document = result('rate.example')
+                    document['checks'] = [{'status': 'rate_limited', 'http_status': 429, **extra}]
+                    store.save_result(document)
+                    with patch('azcheck.checkpoint.time.time', return_value=1000):
+                        store.pause(7200, 'HTTP 429 rate limit')
+                        before = '\n'.join(store._db().iterdump())
+                        self.assertFalse(store.release_legacy_origin_pause())
+                        self.assertEqual('\n'.join(store._db().iterdump()), before)
+
+    def test_legacy_conversion_requires_matching_reason_and_actual_429(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('ok.example'), probe_context={'dns': {'mode': 'antizapret'}})
+            store.save_result(result('ok.example'))
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(3600, 'HTTP 429 rate limit')
+                before = '\n'.join(store._db().iterdump())
+                self.assertFalse(store.release_legacy_origin_pause())
+                self.assertEqual('\n'.join(store._db().iterdump()), before)
+                store.pause(7200, 'DNS resolver rate limit')
+                self.assertFalse(store.release_legacy_origin_pause())
+                self.assertEqual(store.pause_remaining(), 7200)
+
+    def test_legacy_conversion_rolls_back_origin_deadlines_if_global_pause_cannot_be_cleared(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('rate.example'), probe_context={'dns': {'mode': 'antizapret'}})
+            document = result('rate.example')
+            document['checks'] = [{'status': 'rate_limited', 'http_status': 429, 'address': '93.184.215.14'}]
+            store.save_result(document)
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(3600, 'HTTP 429 rate limit')
+                with store._db() as connection:
+                    connection.execute('''
+                        CREATE TRIGGER reject_clear BEFORE UPDATE ON state
+                        WHEN NEW.pause_until = 0 BEGIN
+                            SELECT RAISE(ABORT, 'Synthetic failed legacy conversion');
+                        END
+                    ''')
+                before = '\n'.join(store._db().iterdump())
+                with self.assertRaisesRegex(RuntimeError, 'convert a legacy origin pause'):
+                    store.release_legacy_origin_pause()
+                self.assertEqual('\n'.join(store._db().iterdump()), before)
+                self.assertEqual(store.origin_cooldowns(), {})
+                self.assertEqual(store.pause_remaining(), 3600)
+
+    def test_legacy_conversion_with_mixed_proven_and_ambiguous_429_keeps_global_pause(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('valid.example', 'unknown.example'),
+                          probe_context={'dns': {'mode': 'antizapret'}})
+            for domain, address in (('valid.example', '93.184.215.14'), ('unknown.example', None)):
+                document = result(domain)
+                document['checks'] = [{'status': 'rate_limited', 'http_status': 429, 'address': address}]
+                store.save_result(document)
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(3600, 'HTTP 429 rate limit')
+                before = '\n'.join(store._db().iterdump())
+                self.assertFalse(store.release_legacy_origin_pause())
+                self.assertEqual('\n'.join(store._db().iterdump()), before)
+                self.assertEqual(store.origin_cooldowns(), {})
+                self.assertEqual(store.pause_remaining(), 3600)
 
     def test_pause_survives_reopen_and_never_shortens_existing_deadline(self):
         with ScanCheckpoint(self.report_dir) as store:
