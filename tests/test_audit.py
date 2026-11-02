@@ -42,7 +42,15 @@ class AuditTests(unittest.TestCase):
                 'context': {'selected_groups': {'proxy_dns': 'world_dns'}},
                 'upstreams': [{'id': 'udp://1.1.1.1:53', 'address': '1.1.1.1', 'transport': 'udp'}],
                 'warnings': []}
-        comparison = {'effective_count': 3, 'expanded_count': 7, 'additional_unique': 4}
+        comparison = {
+            'mode': 'raw_expansion', 'unique_count': 7,
+            'unique_contributions': {'generated_host_lists': 2, 'config_additions': 1, 'registry_expansion': 4},
+            'downloaded_entries_omitted': 19,
+            'source_stats': [{'path': '/root/native/download/bol-van-domain.txt',
+                              'valid_entries': 25, 'unique_hostnames': 23, 'added_unique': 4,
+                              'duplicate_targets': 2, 'filtered_entries': 19, 'invalid_entries': 3,
+                              'filter_reasons': {'outside_effective_coverage': 14, 'removed': 5}}],
+        }
         report = write_inventory_audit(self.reports, self.inventory, dns_plan=plan, comparison=comparison)
         saved = json.loads((self.reports / 'inventory-audit.json').read_text())
         self.assertEqual(saved, report)
@@ -68,6 +76,29 @@ class AuditTests(unittest.TestCase):
         self.assertIn('Selected native DNS groups:', text)
         self.assertIn('Configured DNS endpoint: udp://1.1.1.1:53', text)
         self.assertIn('No DNS or HTTPS requests', text)
+        self.assertIn('Raw download expansion comparison:\n  Unique domains: 7\n', text)
+        self.assertIn('Unique-count difference from selected: +4', text)
+        self.assertIn('Unique contributions: config_additions=1, generated_host_lists=2, registry_expansion=4', text)
+        self.assertIn('Filtered downloaded source occurrences: 19', text)
+        self.assertIn('Comparison per-source accounting:\n  /root/native/download/bol-van-domain.txt\n', text)
+        self.assertIn('valid_entries=25, unique_hostnames=23, added_unique=4, duplicate_targets=2, filtered_entries=19, invalid_entries=3', text)
+        self.assertIn('Filter reasons: outside_effective_coverage=14, removed=5', text)
+        self.assertNotIn('Mode comparison:', text)
+        self.assertNotIn('"source_stats"', text)
+
+    def test_comparison_count_difference_is_signed_and_does_not_reuse_source_occurrences(self):
+        for count, expected in ((3, '+0'), (1, '-2'), (779454, '+779451')):
+            with self.subTest(count=count):
+                comparison = {'mode': 'raw_expansion', 'unique_count': count,
+                              'downloaded_entries_omitted': 2041122, 'source_stats': []}
+                report = write_inventory_audit(self.reports, self.inventory, comparison=comparison)
+                text = (self.reports / 'inventory-audit.txt').read_text()
+                self.assertIn(f'Unique-count difference from selected: {expected}\n', text)
+                self.assertIn('Filtered downloaded source occurrences: 2041122', text)
+                self.assertIn('No source accounting available.', text)
+                self.assertEqual(report['comparison'], comparison)
+                self.assertEqual(json.loads((self.reports / 'inventory-audit.json').read_text())['comparison'],
+                                 comparison)
 
     def test_dns_discovery_failure_is_a_reported_audit_result(self):
         report = write_inventory_audit(self.reports, self.inventory,

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=0.4.0
+AZCHECK_VERSION=0.4.1
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
@@ -86,7 +86,7 @@ AZCHECK_PAYLOAD_PY
     chmod 0755 "$program_stage"
     install -d -m 0755 "$program_stage/azcheck"
     install -m 0644 "$stage"/azcheck/*.py "$program_stage/azcheck/"
-    printf '%s\n' "$VERSION" > "$program_stage/.antizapret-domain-check"
+    printf '%s\n' "$AZCHECK_VERSION" > "$program_stage/.antizapret-domain-check"
     chmod 0644 "$program_stage/.antizapret-domain-check"
     if [[ -d $PROGRAM_DIR ]]; then
         previous=$(mktemp -d /opt/.antizapret-domain-check.old.XXXXXX)
@@ -164,7 +164,7 @@ if upgraded != document:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print('[antizapret-domain-check] Updated old scope/report defaults; previous config saved at ' + backup_name)
+    print('[antizapret-domain-check] Updated configuration defaults; previous config saved at ' + backup_name)
 MIGRATE_CONFIG_PY
     fi
     install -d -m 0755 "$UNIT_DIR"
@@ -178,7 +178,7 @@ MIGRATE_CONFIG_PY
         systemctl enable --now "$TIMER"
         log 'Daily scans enabled. Run systemctl list-timers antizapret-domain-check.timer to see the next run.'
     fi
-    log "Installed v$VERSION on this client VPS. Existing configuration and reports are preserved."
+    log "Installed v$AZCHECK_VERSION on this client VPS. Existing configuration and reports are preserved."
     log 'Check the inventory: antizapret-domain-check inventory'
     log 'Audit source counts and native DNS without network checks: antizapret-domain-check audit --compare-download'
     log 'Default scope: generated routing policies plus explicit user additions; raw registry expansion is opt-in.'
@@ -212,7 +212,7 @@ main() {
     local action=install timer_action=keep
     case ${1:-} in
         -h|--help) [[ $# -eq 1 ]] || die 'Use --help by itself.'; usage; return ;;
-        --version) [[ $# -eq 1 ]] || die 'Use --version by itself.'; printf '%s\n' "$VERSION"; return ;;
+        --version) [[ $# -eq 1 ]] || die 'Use --version by itself.'; printf '%s\n' "$AZCHECK_VERSION"; return ;;
     esac
     [[ $# -le 1 ]] || die 'Use one installer action at a time. See --help.'
     case ${1:-} in

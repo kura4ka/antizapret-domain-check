@@ -18,7 +18,7 @@ antizapret-domain-check scan --one-batch
 
 The **audit makes no DNS or HTTPS requests**. It reads local lists and saved DNS configuration, writes the selected domain inventory, and compares its count with optional raw-registry expansion. Check that report before starting a large scan.
 
-The installer provides Python 3, `python3-dnspython`, and curl. Running it again updates the program and keeps the existing timer setting. Version 0.4 upgrades configurations from versions 1–3 to disable the old raw-expansion default and clear the old hardcoded Cloudflare DoH default. It preserves a custom nondefault DoH URL and other supported settings, adds the new DNS options, and backs up changed configuration as `config.json.before-v0.4.*.bak`. Explicit version-4 choices are preserved.
+The installer provides Python 3, `python3-dnspython`, and curl. Running it again updates the program and keeps the existing timer setting. Version 0.4 upgrades configurations from versions 1–3 to disable the old raw-expansion default and clear the old hardcoded Cloudflare DoH default. It preserves a custom nondefault DoH URL and other supported settings, adds the new DNS options, and backs up changed configuration as `config.json.before-v0.4.*.bak`. Explicit version-4 choices are preserved. Version 0.4.1 also fixes the installer printing the operating-system version as the program version and makes the text audit comparison readable; rerunning the installer corrects the installation marker.
 
 ## Which domains are selected?
 

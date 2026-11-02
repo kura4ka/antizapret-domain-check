@@ -38,6 +38,26 @@ def _tsv(value):
     return str(value).replace('\\', '\\\\').replace('\t', '\\t').replace('\r', '\\r').replace('\n', '\\n')
 
 
+def _counts_text(counts):
+    return ', '.join(f'{key}={value}' for key, value in sorted(counts.items())) or 'unavailable'
+
+
+def _source_accounting(sources):
+    lines = []
+    for source in sources:
+        lines.append('  ' + str(source.get('path', 'unknown')))
+        counts = ', '.join(f'{key}={source[key]}' for key in (
+            'valid_entries', 'unique_hostnames', 'added_unique', 'duplicate_targets',
+            'filtered_entries', 'invalid_entries', 'suffix_rules') if key in source)
+        lines.append('    ' + (counts or 'No counts available.'))
+        reasons = source.get('filter_reasons', {})
+        if reasons:
+            lines.append('    Filter reasons: ' + _counts_text(reasons))
+    if not sources:
+        lines.append('  No source accounting available.')
+    return lines
+
+
 def _audit_text(report):
     inventory, dns = report['inventory'], report['dns']
     lines = [f"AntiZapret inventory audit {report['version']} — {report['generated_at']}",
@@ -48,8 +68,7 @@ def _audit_text(report):
              f"download expansion: {inventory.get('include_download', 'unknown')}",
              f"Active routed domains: {report['active_routed_domains']}; "
              f"pending config domains: {report['pending_config_count']}",
-             'Unique contributions: ' + (', '.join(f'{key}={value}' for key, value in
-                                                  report['unique_contributions'].items()) or 'unavailable'),
+             'Unique contributions: ' + _counts_text(report['unique_contributions']),
              f"Filtered downloaded source occurrences: {inventory.get('downloaded_entries_omitted', 0)}; "
              f"invalid source entries: {inventory.get('invalid_source_entries', 0)}; "
              f"valid suffix policy occurrences: {inventory.get('valid_suffix_policy_occurrences', 0)}",
@@ -71,15 +90,23 @@ def _audit_text(report):
         for warning in dns['plan'].get('warnings', []):
             lines.append('DNS WARNING: ' + str(warning))
     if report.get('comparison') is not None:
-        lines.append('Mode comparison: ' + json.dumps(report['comparison'], ensure_ascii=True, sort_keys=True))
+        comparison = report['comparison']
+        count = comparison.get('unique_count')
+        lines.extend(['', 'Raw download expansion comparison:',
+                      '  Unique domains: ' + str(count if count is not None else 'unavailable')])
+        if type(count) is int:
+            difference = count - report['unique_count']
+            lines.append(f'  Unique-count difference from selected: {difference:+d}')
+        lines.extend([
+            '  Unique contributions: ' + _counts_text(comparison.get('unique_contributions', {})),
+            '  Filtered downloaded source occurrences: ' + str(comparison.get('downloaded_entries_omitted', 0)),
+            '', 'Comparison per-source accounting:'])
+        lines.extend(_source_accounting(comparison.get('source_stats', [])))
+        lines.append('')
     lines.extend('NOTICE: ' + str(notice) for notice in report['notices'])
     lines.extend('WARNING: ' + str(warning) for warning in report['warnings'])
     lines.extend(['', 'Per-source accounting:'])
-    for source in report['source_stats']:
-        lines.append(str(source.get('path', 'unknown')) + ': ' + ', '.join(
-            f'{key}={source[key]}' for key in ('valid_entries', 'unique_hostnames', 'added_unique',
-                                            'duplicate_targets', 'filtered_entries', 'invalid_entries',
-                                            'suffix_rules') if key in source))
+    lines.extend(_source_accounting(report['source_stats']))
     lines.extend(['', 'inventory.tsv contains the selected domain, current WARP state, and source references.',
                   'inventory-audit.json contains the full source accounting, DNS plan, and comparison metadata.',
                   'No native AntiZapret lists or routing policies were written.'])

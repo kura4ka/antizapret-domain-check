@@ -124,6 +124,35 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(timer["Timer"]["OnCalendar"], "daily")
         self.assertEqual(timer["Timer"]["Unit"], "antizapret-domain-check.service")
 
+    def test_os_release_version_does_not_replace_program_version_or_marker(self):
+        from azcheck import __version__
+
+        template = (ROOT / 'tools/install.template.sh').read_text(encoding='utf-8')
+        marker = next(line.strip() for line in template.splitlines()
+                      if line.strip().startswith("printf '%s\\n'") and 'program_stage/.antizapret-domain-check' in line)
+        message = next(line.strip() for line in template.splitlines()
+                       if line.strip().startswith('log "Installed v'))
+        # Load the actual installer definitions without invoking installation.
+        # Then reproduce the os-release import and real marker/log expressions.
+        definitions, invocation = template.rsplit('\nmain "$@"', 1)
+        self.assertFalse(invocation.strip())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / 'definitions.sh'
+            script.write_text(definitions + '\n', encoding='utf-8', newline='\n')
+            os_release = root / 'os-release'
+            os_release.write_text('ID=ubuntu\nVERSION="24.04.5 LTS (Noble Numbat)"\nVERSION_ID="24.04"\n',
+                                  encoding='utf-8', newline='\n')
+            result = subprocess.run(
+                [BASH, '-s', '--', script.as_posix(), os_release.as_posix(), root.as_posix()],
+                input='source "$1"\nsource "$2"\nprogram_stage=$3\n' + marker + '\n' + message + '\nmain --version\n',
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((root / '.antizapret-domain-check').read_text().strip(), __version__)
+            self.assertIn('Installed v' + __version__ + ' on this client VPS.', result.stdout)
+            self.assertEqual(result.stdout.splitlines()[-1], __version__)
+            self.assertNotIn('24.04', result.stdout)
+
     def test_help_version_and_bad_flags_do_not_require_installation(self):
         from azcheck import __version__
 
