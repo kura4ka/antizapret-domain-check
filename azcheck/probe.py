@@ -312,9 +312,13 @@ def _https_head(domain, address, timeout):
 
 
 def _check_with_resolvers(domain, timeout, plan, dns_pacer, dns_event, cancelled):
+    checks_mode = plan.get('dns_checks', 'all')
+    if checks_mode not in ('all', 'reference'):
+        raise ProbeError('dns_checks must be all or reference.')
     reference = plan['reference']
-    endpoints = [reference] + [endpoint for endpoint in applicable_resolvers(plan, domain)
-                               if endpoint['id'] != reference['id']]
+    diagnostics = [endpoint for endpoint in applicable_resolvers(plan, domain)
+                   if endpoint['id'] != reference['id']]
+    endpoints = [reference] + (diagnostics if checks_mode == 'all' else [])
     responses = []
     for endpoint in endpoints:
         if cancelled is not None and cancelled():
@@ -339,4 +343,6 @@ def _check_with_resolvers(domain, timeout, plan, dns_pacer, dns_event, cancelled
     result['dns_checks'] = responses
     result['dns_reference'] = reference['id']
     result['dns_mode'] = plan.get('mode', 'antizapret')
+    result['dns_checks_mode'] = checks_mode
+    result['dns_diagnostics_skipped'] = len(diagnostics) if checks_mode == 'reference' else 0
     return result

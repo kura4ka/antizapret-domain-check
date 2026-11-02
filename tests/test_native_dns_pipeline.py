@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 from azcheck import cli
 from azcheck.checkpoint import ScanCheckpoint
 from azcheck.domains import Inventory, InventoryEntry
-from azcheck.probe import check_domain
+from azcheck.probe import ProbeError, check_domain
 from azcheck.resolvers import ResolverError, parse_resolver
 from azcheck.scanner import scan_inventory, write_reports
 
@@ -76,9 +76,77 @@ class NativeDNSProbeTests(unittest.TestCase):
         self.assertEqual([answer['resolver'] for answer in result['dns_checks']], expected)
         self.assertEqual(result['dns_mode'], 'antizapret')
         self.assertEqual(result['dns_reference'], expected[0])
+        self.assertEqual(result['dns_checks_mode'], 'all')
+        self.assertEqual(result['dns_diagnostics_skipped'], 0)
         https.assert_called_once_with(DOMAIN, REFERENCE_IP, 3.0)
         doh.assert_not_called()
         system_dns.assert_not_called()
+
+    def test_reference_mode_queries_only_native_listener_and_marks_omitted_diagnostics(self):
+        self.plan['dns_checks'] = 'reference'
+        events = []
+        with patch('azcheck.probe.query_resolver', side_effect=dns_response) as query, \
+             patch('azcheck.probe._https_head', side_effect=https_response) as https, \
+             patch('azcheck.probe._public_address') as doh, \
+             patch('socket.getaddrinfo') as system_dns:
+            pacer = Mock(return_value=True)
+            result = check_domain(DOMAIN, timeout=3, resolver_plan=self.plan,
+                                  dns_pacer=pacer, dns_event=events.append)
+        query.assert_called_once_with(DOMAIN, self.plan['reference'], 3.0)
+        pacer.assert_called_once()
+        https.assert_called_once_with(DOMAIN, REFERENCE_IP, 3.0)
+        self.assertEqual([event['resolver'] for event in events],
+                         [self.plan['reference']['id']] * 2)
+        self.assertEqual(result['dns_checks_mode'], 'reference')
+        self.assertEqual(result['dns_diagnostics_skipped'], 2)
+        self.assertEqual(result['dns_reference'], self.plan['reference']['id'])
+        self.assertEqual(result['dns_mode'], 'antizapret')
+        self.assertEqual(len(result['dns_checks']), 1)
+        doh.assert_not_called()
+        system_dns.assert_not_called()
+
+    def test_reference_mode_skipped_count_uses_only_applicable_custom_endpoints(self):
+        self.plan['dns_checks'] = 'reference'
+        with patch('azcheck.probe.query_resolver', side_effect=dns_response) as query, \
+             patch('azcheck.probe._https_head', side_effect=https_response):
+            result = check_domain('child.custom.example', resolver_plan=self.plan)
+        query.assert_called_once()
+        self.assertEqual(result['dns_diagnostics_skipped'], 1)
+
+    def test_reference_mode_failure_never_queries_diagnostics_or_uses_other_answers(self):
+        self.plan['dns_checks'] = 'reference'
+        answer = dns_response(DOMAIN, self.plan['reference'], 3)
+        answer.update(status='dns_error', rcode='NXDOMAIN', addresses=[])
+        with patch('azcheck.probe.query_resolver', return_value=answer) as query, \
+             patch('azcheck.probe._https_head') as https:
+            result = check_domain(DOMAIN, resolver_plan=self.plan)
+        query.assert_called_once()
+        https.assert_not_called()
+        self.assertEqual(result['status'], 'dns_error')
+        self.assertEqual(result['dns_checks_mode'], 'reference')
+        self.assertEqual(result['dns_diagnostics_skipped'], 2)
+        self.assertNotIn('incomplete', result)
+
+    def test_reference_mode_cancellation_keeps_domain_pending_without_network_requests(self):
+        self.plan['dns_checks'] = 'reference'
+        with patch('azcheck.probe.query_resolver') as query, \
+             patch('azcheck.probe._https_head') as https:
+            result = check_domain(DOMAIN, resolver_plan=self.plan, cancelled=lambda: True)
+        query.assert_not_called()
+        https.assert_not_called()
+        self.assertTrue(result['incomplete'])
+        self.assertEqual(result['dns_checks'], [])
+        self.assertEqual(result['dns_checks_mode'], 'reference')
+        self.assertEqual(result['dns_diagnostics_skipped'], 2)
+
+    def test_unknown_dns_check_mode_fails_before_any_network_requests(self):
+        self.plan['dns_checks'] = 'unknown'
+        with patch('azcheck.probe.query_resolver') as query, \
+             patch('azcheck.probe._https_head') as https, \
+             self.assertRaisesRegex(ProbeError, 'dns_checks must be all or reference'):
+            check_domain(DOMAIN, resolver_plan=self.plan)
+        query.assert_not_called()
+        https.assert_not_called()
 
     def test_custom_stub_selects_only_its_endpoints_without_primary_or_fallback(self):
         with patch('azcheck.probe.query_resolver', side_effect=dns_response) as query, \

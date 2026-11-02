@@ -279,6 +279,9 @@ def write_reports(report_dir, inventory, results, *, result_count=None, counts=N
                 body.write('  ' + ' | '.join(details) + '\n')
                 if check.get('detail'):
                     body.write('    ' + str(check['detail']) + '\n')
+                if check.get('dns_checks_mode'):
+                    body.write('    DNS checks mode: ' + str(check['dns_checks_mode']) +
+                               '; upstream diagnostics skipped: ' + str(check.get('dns_diagnostics_skipped', 0)) + '\n')
                 for dns_check in check.get('dns_checks', []):
                     body.write('    DNS ' + str(dns_check.get('resolver', 'unknown')) + ': ' +
                                str(dns_check.get('status', 'unknown')) + ' | ' + str(dns_check.get('rcode', '')) +

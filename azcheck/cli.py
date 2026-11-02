@@ -26,7 +26,10 @@ DEFAULTS = {'config_version': 4, 'antizapret_dir': '/root/antizapret',
             'interval_seconds': 0.5, 'include_download': False,
             'batch_size': 500, 'batch_pause_seconds': 300,
             'resolver_url': '', 'resolvers': [], 'dns_config_dir': '/etc/knot-resolver',
-            'dns_interval_seconds': 0.25}
+            'dns_interval_seconds': 0.25, 'dns_checks': 'all'}
+
+FAST_SETTINGS = {'workers': 128, 'interval_seconds': 0, 'dns_interval_seconds': 0,
+                 'batch_size': 5000, 'batch_pause_seconds': 0, 'dns_checks': 'reference'}
 
 
 def _duration(seconds):
@@ -89,12 +92,14 @@ def load_settings(args):
         settings.update(migrate_config(document))
     elif args.config:
         raise ValueError(f'Configuration file not found: {path}')
+    if getattr(args, 'fast', False):
+        settings.update(FAST_SETTINGS)
     overrides = {'az_dir': 'antizapret_dir', 'report_dir': 'report_dir',
                  'timeout': 'timeout_seconds', 'attempts': 'attempts', 'workers': 'workers',
                  'interval': 'interval_seconds', 'resolver_url': 'resolver_url',
                  'batch_size': 'batch_size', 'batch_pause': 'batch_pause_seconds',
                  'resolver': 'resolvers', 'dns_config_dir': 'dns_config_dir',
-                 'dns_interval': 'dns_interval_seconds',
+                 'dns_interval': 'dns_interval_seconds', 'dns_checks': 'dns_checks',
                  'include_download': 'include_download'}
     for flag, key in overrides.items():
         value = getattr(args, flag, None)
@@ -109,19 +114,21 @@ def load_settings(args):
             raise ValueError(f'{key} must be a directory path.')
     if Path(settings['report_dir']).resolve().is_relative_to(Path(settings['antizapret_dir']).resolve()):
         raise ValueError('report_dir must be outside the AntiZapret directory; reports must not become native routing lists.')
-    for key, minimum, maximum in (('attempts', 2, 3), ('workers', 1, 4),
-                                  ('batch_size', 1, 5000), ('batch_pause_seconds', 60, 86400)):
+    for key, minimum, maximum in (('attempts', 2, 3), ('workers', 1, 128),
+                                  ('batch_size', 1, 5000), ('batch_pause_seconds', 0, 86400)):
         if type(settings[key]) is not int or not minimum <= settings[key] <= maximum:
             raise ValueError(f'{key} must be an integer from {minimum} to {maximum}.')
     interval = settings['interval_seconds']
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 0.25 <= interval <= 60:
-        raise ValueError('interval_seconds must be between 0.25 and 60.')
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 0 <= interval <= 60:
+        raise ValueError('interval_seconds must be between 0 and 60.')
     if type(settings['include_download']) is not bool:
         raise ValueError('include_download must be true or false.')
     settings['timeout_seconds'] = validate_timeout(settings['timeout_seconds'])
     dns_interval = settings['dns_interval_seconds']
-    if isinstance(dns_interval, bool) or not isinstance(dns_interval, (int, float)) or not math.isfinite(dns_interval) or not 0.25 <= dns_interval <= 60:
-        raise ValueError('dns_interval_seconds must be between 0.25 and 60.')
+    if isinstance(dns_interval, bool) or not isinstance(dns_interval, (int, float)) or not math.isfinite(dns_interval) or not 0 <= dns_interval <= 60:
+        raise ValueError('dns_interval_seconds must be between 0 and 60.')
+    if settings['dns_checks'] not in ('all', 'reference'):
+        raise ValueError('dns_checks must be all or reference.')
     if settings['resolver_url']:
         settings['resolver_url'] = validate_resolver_url(settings['resolver_url'])
     elif not isinstance(settings['resolver_url'], str):
@@ -138,12 +145,15 @@ def dns_plan(settings):
         endpoints = {endpoint['id']: endpoint for endpoint in map(parse_resolver, settings['resolvers'])}
         values = list(endpoints.values())
         return {'mode': 'explicit', 'reference': values[0], 'upstreams': values[1:],
+                'dns_checks': settings['dns_checks'],
                 'sources': [], 'warnings': ['Explicit DNS overrides are used; native path parity is unverified.']}
     if settings['resolver_url']:
         return {'mode': 'explicit-doh', 'resolver_url': settings['resolver_url'], 'upstreams': [],
+                'dns_checks': settings['dns_checks'],
                 'sources': [], 'warnings': ['Explicit DoH override is used; native DNS discovery is disabled.']}
     plan = discover_resolvers(Path(settings['antizapret_dir']), knot_dir=Path(settings['dns_config_dir']))
     plan['mode'] = 'antizapret'
+    plan['dns_checks'] = settings['dns_checks']
     return plan
 
 
@@ -161,20 +171,26 @@ def parser():
                          help='Opt in to raw-registry subdomain expansion (default: disabled)')
         sub.add_argument('--dns-config-dir', help='Installed Knot configuration directory')
         if command in ('scan', 'audit'):
+            sub.add_argument('--dns-checks', choices=('all', 'reference'),
+                             help='Compare all applicable upstreams or query only the DNS reference')
             sub.add_argument('--report-dir', help='Report directory (default: ' + DEFAULTS['report_dir'] + ')')
         if command == 'audit':
             sub.add_argument('--compare-download', action='store_true', help='Also calculate inventory counts with raw expansion enabled')
         if command == 'scan':
+            sub.add_argument('--fast', action='store_true',
+                             help='Use native/reference DNS only, 128 workers and no artificial pacing or stage pauses; explicit flags override the profile')
             sub.add_argument('--timeout', type=float, help='Seconds per DNS/HTTPS phase (1..60)')
             sub.add_argument('--attempts', type=int, help='Attempts for potential routing failures (2..3)')
-            sub.add_argument('--workers', type=int, help='Concurrent domains (1..4)')
-            sub.add_argument('--interval', type=float, help='Minimum seconds between domain attempts (0.25..60)')
+            sub.add_argument('--workers', type=int, help='Concurrent domains (1..128)')
+            sub.add_argument('--interval', type=float, help='Minimum seconds between domain attempts (0..60)')
             sub.add_argument('--resolver-url', help='HTTPS DNS JSON resolver URL')
             sub.add_argument('--resolver', action='append', help='Explicit DNS endpoint, repeatable; bypasses native discovery')
-            sub.add_argument('--dns-interval', type=float, help='Minimum seconds between individual DNS queries (0.25..60)')
+            sub.add_argument('--dns-interval', type=float, help='Minimum seconds between individual DNS queries (0..60)')
             sub.add_argument('--batch-size', type=int, help='Domains per stage (1..5000; default: 500)')
-            sub.add_argument('--batch-pause', type=int, help='Seconds between stages (60..86400; default: 300)')
+            sub.add_argument('--batch-pause', type=int, help='Seconds between stages (0..86400; default: 300)')
             sub.add_argument('--one-batch', action='store_true', help='Run one stage, save progress, then exit')
+            sub.add_argument('--retry-failed', action='store_true',
+                             help='Recheck saved candidates/inconclusive domains with the same DNS/probe settings; retain successful checks and cooldowns')
             sub.add_argument('--restart', action='store_true', help='Start a fresh run; any saved cooldown still applies')
             sub.add_argument('--quiet', action='store_true')
     return result
@@ -240,20 +256,42 @@ def main(argv=None):
             print('DNS mode: ' + plan['mode'] + '; reference: ' +
                   (plan.get('reference', {}).get('id') or plan.get('resolver_url', 'unknown')) +
                   f"; {len(plan.get('upstreams', []))} upstream diagnostic endpoints.", file=sys.stderr, flush=True)
+            print('DNS checks: ' + plan.get('dns_checks', 'all') +
+                  ('; direct upstream diagnostics are skipped.' if plan.get('dns_checks') == 'reference' else
+                   '; every applicable configured upstream is compared.'), file=sys.stderr, flush=True)
+            print(f"Workers: {settings['workers']}; minimum domain/DNS intervals: " +
+                  f"{settings['interval_seconds']}s/{settings['dns_interval_seconds']}s.", file=sys.stderr, flush=True)
             for warning in plan.get('warnings', []):
                 print('WARNING: ' + warning, file=sys.stderr, flush=True)
             minimum = max(0, len(inventory.entries) - 1) * settings['interval_seconds']
             print('Fresh-run domain-attempt pacing floor: ' + _duration(minimum) +
                   '; this excludes individual DNS pacing, batch pauses, retries and network delays. '
                   'Saved checks reduce remaining work.', file=sys.stderr, flush=True)
+            queries = 0
             if plan['mode'] != 'explicit-doh':
-                queries = sum(1 + sum(endpoint['id'] != plan['reference']['id']
-                                      for endpoint in applicable_resolvers(plan, entry.domain))
-                              for entry in inventory.entries)
+                if plan.get('dns_checks') == 'reference':
+                    queries = len(inventory.entries)
+                else:
+                    queries = sum(1 + sum(endpoint['id'] != plan['reference']['id']
+                                          for endpoint in applicable_resolvers(plan, entry.domain))
+                                  for entry in inventory.entries)
                 dns_minimum = max(0, queries - 1) * settings['dns_interval_seconds']
                 print(f'Fresh-run DNS matrix: {queries} queries before retries; DNS pacing floor ' +
                       _duration(dns_minimum) + '. Domain and DNS pacing overlap; batch pauses and '
                       'network delays add time.', file=sys.stderr, flush=True)
+            batches = math.ceil(len(inventory.entries) / settings['batch_size'])
+            pauses = max(0, batches - 1) * settings['batch_pause_seconds']
+            # Each stage starts without a pacing delay. Its cooldown replaces
+            # the spacing between stages, so do not count that spacing twice.
+            staged_domain_floor = max(0, len(inventory.entries) - batches) * settings['interval_seconds']
+            staged_dns_floor = max(0, queries - batches) * settings['dns_interval_seconds']
+            fresh_floor = max(staged_domain_floor, staged_dns_floor) + pauses
+            if fresh_floor:
+                print('Fresh-run pacing + batch-pause floor: ' + _duration(fresh_floor) +
+                      '; an ideal lower bound, not a completion estimate.', file=sys.stderr, flush=True)
+            else:
+                print('No artificial pacing or inter-stage pauses. Remaining time is estimated from '
+                      'observed throughput during the scan.', file=sys.stderr, flush=True)
             print(f"Stages: up to {settings['batch_size']} domains; "
                   f"{settings['batch_pause_seconds']}s pause between stages. "
                   'Completed checks are saved for resume.', file=sys.stderr, flush=True)
@@ -312,7 +350,10 @@ def main(argv=None):
         report_dir = Path(settings['report_dir'])
         dns_pacer = _Pacer(settings['dns_interval_seconds'])
         with report_lock(report_dir), ScanCheckpoint(report_dir) as checkpoint:
-            new_run = checkpoint.prepare(inventory, restart=args.restart, probe_context=probe_context)
+            new_run = checkpoint.prepare(inventory, restart=args.restart, probe_context=probe_context,
+                                         retry_failed=args.retry_failed)
+            if args.retry_failed:
+                log(f"Requeued {checkpoint.info().get('requeued_count', 0)} saved candidate/inconclusive domains; successful checks retained.")
             refresh_suggestions(report_dir, checkpoint)
             write_inventory_audit(report_dir, inventory, plan)
             if checkpoint.info().get('context_changed'):
@@ -379,6 +420,7 @@ def main(argv=None):
                                    workers=settings['workers'], interval_seconds=settings['interval_seconds'],
                                    timeout_seconds=settings['timeout_seconds'], resolver_url=settings['resolver_url'],
                                    probe_fn=probe, stop_event=stop_event,
+                                   retry_delay_seconds=0 if args.fast else 1,
                                    completed=completed,
                                    progress=None if args.quiet else lambda done, total: progress(
                                        already_done + done, len(inventory.entries)),
@@ -410,9 +452,12 @@ def main(argv=None):
                 if args.one_batch:
                     break
             if not pending:
-                if not checkpoint.info()['completed']:
+                if not checkpoint.info()['completed'] or (
+                        args.retry_failed and initial_completed == len(inventory.entries)):
                     snapshot([], final=True)
                     checkpoint.mark_complete()
+                if args.retry_failed:
+                    refresh_suggestions(report_dir, checkpoint)
                 if not args.quiet:
                     print(f"Checked {checkpoint.completed_count()} domains; tentative candidates: "
                           f"{checkpoint.counts().get('candidate', 0)}.")

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-AZCHECK_VERSION=0.4.1
+AZCHECK_VERSION=0.5.0
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
@@ -124,7 +124,8 @@ WRAPPER_SH
   "resolver_url": "",
   "resolvers": [],
   "dns_config_dir": "/etc/knot-resolver",
-  "dns_interval_seconds": 0.25
+  "dns_interval_seconds": 0.25,
+  "dns_checks": "all"
 }
 CONFIG_JSON
         install -m 0600 "$stage/config.json" "$CONFIG_DIR/config.json"
@@ -183,6 +184,9 @@ MIGRATE_CONFIG_PY
     log 'Audit source counts and native DNS without network checks: antizapret-domain-check audit --compare-download'
     log 'Default scope: generated routing policies plus explicit user additions; raw registry expansion is opt-in.'
     log 'Default DNS: discover AntiZapret real-answer resolver and selected upstreams. Unknown configurations require explicit DNS overrides.'
+    log 'Faster scan: antizapret-domain-check scan --fast (native/reference DNS only, 128 workers, no artificial delays or stage pauses).'
+    log 'Recheck saved failures with matching options: antizapret-domain-check scan --fast --retry-failed'
+    log 'Full upstream comparison remains available: antizapret-domain-check scan --dns-checks all'
     log 'Run stages with saved progress: antizapret-domain-check scan'
     log 'Run one stage only: antizapret-domain-check scan --one-batch'
     log 'Default stages: 500 domains, then a 5-minute pause. Re-run scan to resume interrupted work.'

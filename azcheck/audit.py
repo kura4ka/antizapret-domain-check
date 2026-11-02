@@ -77,6 +77,7 @@ def _audit_text(report):
     if dns['error']:
         lines.append('DNS discovery error: ' + dns['error'])
     if isinstance(dns['plan'], dict):
+        lines.append('DNS checks scope: ' + str(dns['plan'].get('dns_checks', 'all')))
         reference = dns['plan'].get('reference')
         if reference:
             lines.append('Reference DNS endpoint: ' + str(reference.get('id', reference) if isinstance(reference, dict) else reference))

@@ -2,7 +2,7 @@
 
 Check AntiZapret domain availability from the **client VPS** and produce a reviewable list of possible WARP/donor candidates. This is separate from [antizapret-relay](https://github.com/kura4ka/antizapret-relay).
 
-Version **0.4.0** uses generated routing lists by default, audits exactly where its domain count comes from, and discovers AntiZapret's saved DNS configuration. Checks run in resumable stages. The checker writes its own reports and checkpoint; it does not change AntiZapret routing or restart its services.
+Version **0.5.0** adds `scan --fast` for large inventories and retains full upstream comparisons as a separate diagnostic mode. It uses generated routing lists by default, audits exactly where its domain count comes from, and discovers AntiZapret's saved DNS configuration. Checks run in resumable stages. The checker writes its own reports and checkpoint; it does not change AntiZapret routing or restart its services.
 
 ## On the client VPS
 
@@ -13,7 +13,9 @@ curl -fSL https://raw.githubusercontent.com/kura4ka/antizapret-domain-check/main
 bash install.sh
 antizapret-domain-check audit --compare-download
 cat /root/antizapret-domain-check/reports/inventory-audit.txt
-antizapret-domain-check scan --one-batch
+antizapret-domain-check scan --fast --one-batch
+# Continue the remaining stages:
+antizapret-domain-check scan --fast
 ```
 
 The **audit makes no DNS or HTTPS requests**. It reads local lists and saved DNS configuration, writes the selected domain inventory, and compares its count with optional raw-registry expansion. Check that report before starting a large scan.
@@ -74,7 +76,7 @@ The default reads these installed files without executing their Lua, Python, or 
 /usr/lib/knot-resolver/kres_modules/fallback.lua   # when enabled
 ```
 
-AntiZapret's client-facing DNS can return fake addresses for routing. Its proxy obtains real destination answers through the local Knot listener **`127.3.3.3:53`**. The checker uses that real-answer listener as its DNS reference, then queries every endpoint in the selected proxy DNS group and any applicable custom/fallback policies for comparison. It preserves configured ports and records each DNS response. Definitions for unused DNS groups are not extra scan endpoints.
+AntiZapret's client-facing DNS can return fake addresses for routing. Its proxy obtains real destination answers through the local Knot listener **`127.3.3.3:53`**. The checker uses that real-answer listener as its DNS reference. In full comparison mode (`--dns-checks all`, the ordinary default), it also queries every endpoint in the selected proxy DNS group and any applicable custom/fallback policies for comparison. It preserves configured ports and records each DNS response. Definitions for unused DNS groups are not extra scan endpoints.
 
 For example, the upstream `world_dns` group includes Cloudflare and Quad9 addresses, including `9.9.9.10`, rather than assuming `9.9.9.9`. The selected `russia_dns` group contains MSK-IX and other Russian endpoints. The checker reads the actual saved values; it does not substitute a provider list or system resolver.
 
@@ -89,9 +91,41 @@ antizapret-domain-check scan --one-batch \
 
 The first explicit endpoint becomes the HTTPS DNS reference; other listed endpoints are comparisons. UDP, TCP, and TLS endpoints are supported; TLS uses `tls://IP:853#certificate-hostname`. `--resolver-url https://.../dns-query` retains the explicit legacy DNS-JSON DoH mode. Overrides are reported as overrides and cannot be combined with each other. There is no automatic Cloudflare or system-DNS fallback.
 
+## Fast scan for large inventories
+
+```bash
+antizapret-domain-check scan --fast
+# Or finish one stage and exit, then repeat the same command to resume:
+antizapret-domain-check scan --fast --one-batch
+```
+
+`--fast` is a per-invocation profile: **128 workers**, **5000 domains per stage**, **zero artificial domain/DNS pacing**, and **zero pause between completed stages**, and **no artificial delay before a retry**. Throughput is bounded by active workers, VPS resources, and DNS/HTTPS response times. It uses **`dns_checks: reference`**, so the normal native setup sends one query per attempt to `127.3.3.3:53` and lets Knot choose the configured upstream through its own policy. The 12 direct upstream comparisons are skipped. DNS routing remains native; skipped diagnostics are explicitly recorded in reports.
+
+For 627,432 names, that reduces checker DNS calls from 8,156,616 to 627,432 before retries. The previous 23.6-day DNS pacing floor disappears. The CLI reports observed throughput and an evolving remaining-time estimate; no completion time is promised because timeouts, retries, VPS resources, and actual rate-limit responses still affect duration. No domains are silently removed from the inventory, and checks still verify HTTPS certificates.
+
+Explicit command-line flags override the profile. For example:
+
+```bash
+antizapret-domain-check scan --fast --workers 32
+# Retain fast pacing but restore every applicable direct upstream comparison:
+antizapret-domain-check scan --fast --dns-checks all
+```
+
+The profile does not rewrite saved settings, resolver overrides, lists, or report paths. Continue using `--fast` when resuming this mode; changing DNS comparison scope invalidates incompatible saved outcomes while retaining cooldowns and batch report history. HTTP `429` still stops the scan and saves its cooldown. Use `--quiet` if terminal output limits throughput; reports and checkpoints are still written. HTTPS certificates and public destination addresses are validated in every mode; fast mode never uses `curl -k`.
+
+## Recheck saved failures
+
+```bash
+antizapret-domain-check scan --fast --retry-failed
+```
+
+This requeues saved **candidate** and **inconclusive** results, including failed DNS/HTTPS checks, and retains successful checks. It uses the current routing inventory, so removed domains are not resurrected. It also continues any unfinished domains in that inventory. Repeat the original DNS, timeout, and attempt flags: changing semantic probe settings is rejected for this partial retry, rather than relabeling old successful results. Worker counts and pacing can change. `--restart` and `--retry-failed` cannot be combined.
+
+Saved HTTP-429 cooldowns still apply. The ordinary scan automatically resumes checks interrupted before completion; `--retry-failed` additionally retries failures already saved as completed. A completed scan can be partially retried without restarting every successful domain. `--retry-failed` starts a new retry sweep each time it is supplied. After Ctrl+C or `--one-batch`, resume that sweep with `scan --fast` **without** `--retry-failed`, so persistent early failures are not requeued ahead of unfinished targets again. To force a new full run with different DNS/probe settings, use `--restart`.
+
 ## Run in stages
 
-Defaults: **500 domains per stage**, **5 minutes between stages**, **2 workers**, and at least **0.5 seconds between domain-attempt starts**. Individual DNS queries across workers are additionally paced at least **0.25 seconds apart**. Checking multiple relevant resolvers increases the work per domain.
+Without `--fast`, defaults remain: **500 domains per stage**, **5 minutes between stages**, **2 workers**, and at least **0.5 seconds between domain-attempt starts**. Individual DNS queries across workers are additionally paced at least **0.25 seconds apart**. Checking multiple relevant resolvers increases the work per domain.
 
 ```bash
 # One stage, then exit. Repeat to resume.
@@ -158,11 +192,12 @@ The installed command reads `/etc/antizapret-domain-check/config.json`:
   "resolver_url": "",
   "resolvers": [],
   "dns_config_dir": "/etc/knot-resolver",
-  "dns_interval_seconds": 0.25
+  "dns_interval_seconds": 0.25,
+  "dns_checks": "all"
 }
 ```
 
-Empty `resolver_url` and `resolvers` select native discovery. A version-4 configuration may deliberately set `include_download: true` to retain raw expansion. Keep `report_dir` outside the AntiZapret directory; paths inside it are rejected so generated reports cannot become native routing inputs.
+Empty `resolver_url` and `resolvers` select native discovery. `dns_checks` accepts `all` (full comparisons) or `reference` (reference only); it is optional in existing version-4 configurations and defaults to `all`. CLI settings override the saved configuration; explicit flags override `--fast`. A version-4 configuration may deliberately set `include_download: true` to retain raw expansion. Keep `report_dir` outside the AntiZapret directory; paths inside it are rejected so generated reports cannot become native routing inputs.
 
 ## Optional daily scans and removal
 
@@ -172,7 +207,7 @@ systemctl list-timers antizapret-domain-check.timer
 journalctl -u antizapret-domain-check.service
 ```
 
-The daily timer uses the same resumable stages and cooldowns. A large service run can span several days; systemd does not start another copy while it is active. Disable scheduled scans with `bash install.sh --disable-timer`. Remove the checker with `bash install.sh --uninstall`; configuration and reports are retained.
+The daily timer uses the ordinary saved settings and resumable stages; a one-off `--fast` flag does not change the timer. To use equivalent settings for scheduled runs, set `workers: 128`, `interval_seconds: 0`, `dns_interval_seconds: 0`, `batch_size: 5000`, `batch_pause_seconds: 0`, and `dns_checks: "reference"` in the saved JSON configuration. A large service run can span several days; systemd does not start another copy while it is active. Disable scheduled scans with `bash install.sh --disable-timer`. Remove the checker with `bash install.sh --uninstall`; configuration and reports are retained.
 
 ## Development
 

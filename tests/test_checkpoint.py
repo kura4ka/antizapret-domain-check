@@ -250,6 +250,138 @@ class CheckpointTests(unittest.TestCase):
             with patch('azcheck.checkpoint.time.time', return_value=1100):
                 self.assertEqual(store.pause_remaining(), 200)
 
+    def test_retry_failed_requeues_candidate_and_inconclusive_preserves_successes_and_run(self):
+        targets = inventory('blocked.example', 'dns.example', 'timeout.example', 'ok.example', 'reachable.example')
+        context = {'dns': ['1.1.1.1'], 'timeout': 8, 'attempts': 2}
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context=context)
+            store.save_result(result('blocked.example', 'candidate'))
+            for domain, status, code in (('dns.example', 'dns_error', None),
+                                         ('timeout.example', 'transport_error', None),
+                                         ('reachable.example', 'reachable', 404)):
+                document = result(domain)
+                document['checks'] = [{'status': status, 'http_status': code}]
+                store.save_result(document)
+            success = store.save_result(result('ok.example'))
+            store.finish_batch()
+            store.mark_complete()
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(7200, 'HTTP 429 rate limit')
+            previous = store.info()
+
+        with ScanCheckpoint(self.report_dir) as store:
+            self.assertFalse(store.prepare(targets, probe_context=context, retry_failed=True))
+            current = store.info()
+            self.assertEqual(current['run_id'], previous['run_id'])
+            self.assertEqual(current['started_at'], previous['started_at'])
+            self.assertEqual(current['probe_context_sha256'], previous['probe_context_sha256'])
+            self.assertEqual(current['batch_index'], 1)
+            self.assertEqual(current['requeued_count'], 3)
+            self.assertFalse(current['completed'])
+            self.assertEqual(current['pause_until'], previous['pause_until'])
+            self.assertEqual(current['pause_reason'], previous['pause_reason'])
+            self.assertEqual([entry.domain for entry in store.pending_entries(targets)],
+                             ['blocked.example', 'dns.example', 'timeout.example'])
+            self.assertEqual(store.counts(), {'reachable': 2})
+            self.assertEqual(next(row for row in store.iter_results() if row['domain'] == 'ok.example'), success)
+            with patch('azcheck.checkpoint.time.time', return_value=1100):
+                self.assertEqual(store.pause_remaining(), 7100)
+
+    def test_retry_failed_only_deletes_current_targets_and_uses_base_decision(self):
+        original = inventory('removed.example', 'flagged.example', 'kept.example')
+        original.entries[1].excluded = True
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(original)
+            store.save_result(result('removed.example', 'candidate'))
+            store.save_result(result('flagged.example', 'candidate'))
+            store.save_result(result('kept.example'))
+            removed_before = store._db().execute(
+                'SELECT * FROM results WHERE domain = ?', ('removed.example',)).fetchone()
+            updated = inventory('flagged.example', 'kept.example')
+            updated.entries[0].included = True
+            updated.entries[0].excluded = True
+            updated.entries[1].sources = ['config/new-include-hosts.txt:7']
+            self.assertFalse(store.prepare(updated, retry_failed=True))
+            self.assertEqual(store.info()['requeued_count'], 1)
+            self.assertEqual([entry.domain for entry in store.pending_entries(updated)], ['flagged.example'])
+            self.assertEqual(store._db().execute(
+                'SELECT * FROM results WHERE domain = ?', ('removed.example',)).fetchone(), removed_before)
+            self.assertEqual(list(store.iter_results())[0]['sources'], ['config/new-include-hosts.txt:7'])
+            self.assertFalse(store.prepare(original))
+            self.assertEqual(store.info()['requeued_count'], 0)
+            self.assertEqual(store.completed_count(), 2)
+
+    def test_retry_failed_without_failures_preserves_completed_run_and_results(self):
+        targets = inventory('ok.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets)
+            saved = store.save_result(result('ok.example'))
+            store.mark_complete()
+            run_id = store.info()['run_id']
+            self.assertFalse(store.prepare(targets, retry_failed=True))
+            self.assertEqual(store.info()['run_id'], run_id)
+            self.assertEqual(store.info()['requeued_count'], 0)
+            self.assertTrue(store.info()['completed'])
+            self.assertEqual(store.pending_entries(targets), [])
+            self.assertEqual(list(store.iter_results()), [saved])
+            with ScanCheckpoint(self.report_dir) as reopened:
+                self.assertEqual(reopened.info()['requeued_count'], 0)
+
+    def test_retry_failed_reopens_completed_state_for_new_pending_targets(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('ok.example'))
+            store.save_result(result('ok.example'))
+            store.mark_complete()
+            run_id = store.info()['run_id']
+            updated = inventory('ok.example', 'new.example')
+            self.assertFalse(store.prepare(updated, retry_failed=True))
+            self.assertEqual(store.info()['run_id'], run_id)
+            self.assertEqual(store.info()['requeued_count'], 0)
+            self.assertFalse(store.info()['completed'])
+            self.assertEqual([entry.domain for entry in store.pending_entries(updated)], ['new.example'])
+            self.assertEqual(store.completed_count(), 1)
+
+    def test_retry_failed_requires_existing_run_and_rejects_restart_before_writes(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            before = '\n'.join(store._db().iterdump())
+            with self.assertRaisesRegex(ValueError, 'existing scan run'):
+                store.prepare(inventory('new.example'), retry_failed=True)
+            self.assertEqual('\n'.join(store._db().iterdump()), before)
+            store.prepare(inventory('ok.example'))
+            store.save_result(result('ok.example'))
+            before = '\n'.join(store._db().iterdump())
+            with self.assertRaisesRegex(ValueError, 'cannot be combined with restart'):
+                store.prepare(inventory('different.example'), restart=True, retry_failed=True)
+            self.assertEqual('\n'.join(store._db().iterdump()), before)
+
+    def test_retry_failed_changed_probe_context_fails_before_replacing_targets_or_results(self):
+        targets = inventory('failed.example', 'ok.example')
+        context = {'dns': ['1.1.1.1'], 'timeout': 8, 'attempts': 2}
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context=context)
+            store.save_result(result('failed.example', 'candidate'))
+            store.save_result(result('ok.example'))
+            store.mark_complete()
+            before = '\n'.join(store._db().iterdump())
+            for changed in ({**context, 'dns': ['9.9.9.9']}, {**context, 'timeout': 4},
+                            {**context, 'attempts': 3}, {**context, 'probe_version': 99}):
+                with self.subTest(context=changed), self.assertRaisesRegex(
+                        ValueError, 'Repeat the original DNS, timeout and attempts flags'):
+                    store.prepare(inventory('different.example'), probe_context=changed, retry_failed=True)
+                self.assertEqual('\n'.join(store._db().iterdump()), before)
+            self.assertEqual(store.info()['requeued_count'], 0)
+            self.assertTrue(store.info()['completed'])
+
+    def test_retry_failed_cannot_adopt_context_for_unrecorded_checks(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            targets = inventory('failed.example')
+            store.prepare(targets)
+            store.save_result(result('failed.example', 'candidate'))
+            before = '\n'.join(store._db().iterdump())
+            with self.assertRaisesRegex(ValueError, 'DNS/probe context changed'):
+                store.prepare(targets, probe_context={'dns': ['1.1.1.1']}, retry_failed=True)
+            self.assertEqual('\n'.join(store._db().iterdump()), before)
+
     def test_pause_survives_reopen_and_never_shortens_existing_deadline(self):
         with ScanCheckpoint(self.report_dir) as store:
             store.prepare(inventory('one.example'))

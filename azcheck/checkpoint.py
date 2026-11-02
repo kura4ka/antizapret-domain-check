@@ -74,6 +74,7 @@ class ScanCheckpoint:
         self._connection = None
         self._context_changed = False
         self._reset_reason = ''
+        self._requeued_count = 0
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._connection = sqlite3.connect(str(self.path), timeout=5)
@@ -207,22 +208,32 @@ class ScanCheckpoint:
             raise RuntimeError('Prepare the scan checkpoint before saving or completing a batch.')
         return state
 
-    def prepare(self, inventory, restart=False, probe_context=None):
+    def prepare(self, inventory, restart=False, probe_context=None, retry_failed=False):
         """Resume compatible outcomes or start fresh after probe/DNS changes.
 
         Omitting context preserves the legacy API. Production callers supply
         their complete semantic probe context so unrecorded legacy checks and
-        incompatible results cannot silently count as completed work.
+        incompatible results cannot silently count as completed work. Retrying
+        failures preserves the existing run and requires a compatible context.
         """
+        if retry_failed and restart:
+            raise ValueError('retry_failed cannot be combined with restart; choose one scan action.')
         state = self._state()
+        if retry_failed and not state['run_id']:
+            raise ValueError('retry_failed requires an existing scan run; run a normal scan first.')
         encoded, fingerprint = state['probe_context_json'], state['probe_context_sha256']
         if probe_context is not None:
             encoded, fingerprint = _encode_probe_context(probe_context)
         context_changed = bool(state['run_id'] and probe_context is not None
                                and fingerprint != state['probe_context_sha256'])
-        new_run = bool(restart or state['completed'] or not state['run_id'] or context_changed)
+        if retry_failed and context_changed:
+            raise ValueError('Cannot retry failed checks after DNS/probe context changed. '
+                             'Repeat the original DNS, timeout and attempts flags, or use restart for a fresh scan.')
+        new_run = bool(not retry_failed and (restart or state['completed'] or not state['run_id'] or context_changed))
         reset_reason = ''
-        if restart:
+        if retry_failed:
+            reset_reason = 'Retrying failed checks in the existing scan run.'
+        elif restart:
             reset_reason = 'Explicit restart requested.'
         elif context_changed:
             reset_reason = ('DNS/probe context changed.' if state['probe_context_sha256']
@@ -231,6 +242,7 @@ class ScanCheckpoint:
             reset_reason = 'The previous run completed; starting fresh checks.'
         elif not state['run_id']:
             reset_reason = 'Starting the first scan run.'
+        requeued_count = 0
         with self._transaction('prepare') as connection:
             if new_run:
                 connection.execute('DELETE FROM results')
@@ -245,8 +257,21 @@ class ScanCheckpoint:
                 VALUES (?, ?, ?, ?)
             ''', ((entry.domain, json.dumps(entry.sources, ensure_ascii=True, allow_nan=False),
                    int(entry.included), int(entry.excluded)) for entry in inventory.entries))
+            if retry_failed:
+                requeued_count = connection.execute('''
+                    DELETE FROM results
+                    WHERE base_decision IN ('candidate', 'inconclusive')
+                      AND EXISTS (SELECT 1 FROM targets WHERE targets.domain = results.domain)
+                ''').rowcount
+                missing = requeued_count or connection.execute('''
+                    SELECT 1 FROM targets LEFT JOIN results USING (domain)
+                    WHERE results.domain IS NULL LIMIT 1
+                ''').fetchone()
+                if missing:
+                    connection.execute('UPDATE state SET completed = 0 WHERE singleton = 1')
         self._context_changed = context_changed
         self._reset_reason = reset_reason
+        self._requeued_count = requeued_count
         return new_run
 
     def pending_entries(self, inventory):
@@ -386,6 +411,7 @@ class ScanCheckpoint:
                                                       state['probe_context_sha256'])
         state['context_changed'] = self._context_changed
         state['reset_reason'] = self._reset_reason
+        state['requeued_count'] = self._requeued_count
         with self._transaction('read') as connection:
             state['total'] = connection.execute('SELECT COUNT(*) FROM targets').fetchone()[0]
         state['completed_count'] = self.completed_count()
