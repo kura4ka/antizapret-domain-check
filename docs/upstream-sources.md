@@ -1,30 +1,80 @@
-# AntiZapret routing sources
+# AntiZapret routing and DNS source map
 
-Inspected [GubernievS/AntiZapret-VPN](https://github.com/GubernievS/AntiZapret-VPN) at commit `aabea42bb51520371c8afc2b9b82cc6966068660`. All paths below are relative to `/root/antizapret/` on the client VPS.
+The download/parse audit used [GubernievS/AntiZapret-VPN at `aabea42bb51520371c8afc2b9b82cc6966068660`](https://github.com/GubernievS/AntiZapret-VPN/tree/aabea42bb51520371c8afc2b9b82cc6966068660). DNS templates were also inspected from the fetched current upstream source tree during the 0.4 audit. The checker discovers the **installed files on each VPS**, not a hardcoded copy of either version.
 
-[`update.sh`](https://github.com/GubernievS/AntiZapret-VPN/blob/aabea42bb51520371c8afc2b9b82cc6966068660/setup/root/antizapret/update.sh) downloads the raw inputs. [`parse.sh`](https://github.com/GubernievS/AntiZapret-VPN/blob/aabea42bb51520371c8afc2b9b82cc6966068660/setup/root/antizapret/parse.sh) combines them with user configuration and writes effective host lists and RPZ policies. The checker reads local copies and never executes these scripts or sources the shell `setup` file.
+All AntiZapret-relative paths below are under `/root/antizapret/`.
 
-| Input or result | Purpose |
+## Downloads
+
+[`update.sh`](https://github.com/GubernievS/AntiZapret-VPN/blob/aabea42bb51520371c8afc2b9b82cc6966068660/setup/root/antizapret/update.sh) downloads the raw inputs before running custom update hooks.
+
+| Local input | Verified upstream origin/purpose |
 | --- | --- |
-| `download/bol-van-domain.txt` | `bol-van/rulist` registry, fetched from `reestr_hostname.txt` |
-| `download/antifilter-download-domain.txt` | Registry fetched from `antifilter.download/list/domains.lst` |
-| `download/*include-hosts.txt`, `config/*include-hosts.txt` | Additional normal AntiZapret domain includes |
-| `download/*exclude-hosts.txt`, `config/*exclude-hosts.txt` | Exceptions to normal domain routing |
-| `download/*remove-hosts.txt`, `config/*remove-hosts.txt` | Names removed during parsing |
-| `download/*include-warp-hosts.txt`, `config/*include-warp-hosts.txt` | WARP domain includes |
-| `config/*exclude-warp-hosts.txt` | WARP exceptions |
-| `result/include-hosts.txt`, `result/exclude-hosts.txt` | Normal routed domain rules after filtering and redundant-subdomain removal |
-| `result/include-warp-hosts.txt`, `result/exclude-warp-hosts.txt` | Generated WARP host rules |
-| `result/proxy.rpz`, `result/warp.rpz`, `result/warp2.rpz` | Generated resolver routing policies |
-| `config/*proxy-rpz.txt`, `config/*warp-rpz.txt` | Custom RPZ routing policies appended by the parser |
-| `result/route-ips.txt` | IP/CIDR routes; these do not identify all corresponding hostnames |
+| `download/bol-van-domain.txt` | `https://raw.githubusercontent.com/bol-van/rulist/main/reestr_hostname.txt` |
+| `download/antifilter-download-domain.txt` | `https://antifilter.download/list/domains.lst`; the upstream update tolerates this optional download failing |
+| `download/include-hosts.txt` | AntiZapret's bundled normal includes |
+| `download/include-warp-hosts.txt` | AntiZapret's bundled WARP includes |
+| `download/exclude-hosts.txt` | Bundled normal exceptions; selected source depends on `ROUTE_ALL` |
+| `download/remove-hosts.txt` | Bundled removal list, downloaded compressed and unpacked |
+| `download/*include-adblock-hosts.txt`, AdGuard/OISD inputs, and deny RPZ inputs | DNS blocking inputs, not routed-host target lists |
+| `download/*ips.txt` | IP/network routing inputs, not an enumeration of hostnames |
+| `config/*.txt`, `custom-update.sh` outputs | User additions and custom sources consumed by the corresponding globs |
 
-The normal parser also applies `CLEAR_HOSTS`, removal lists, exclusions and parent-domain compression. Downloaded raw names are therefore checked against generated routing coverage rather than all being assumed routed. Known finite children of a routed parent are retained as distinct probe targets even when the parser compressed those children into the parent rule. User configuration additions remain visible immediately, with a warning when source files are newer than generated lists.
+Bol-van and AntiFilter are intentional native AntiZapret sources. The standalone checker does not download or refresh these files.
 
-When generated routing files are missing, the checker uses source lists and reports that coverage is a fallback. It cannot reproduce every setup-dependent filter without the parsed results. Run AntiZapret's normal parser separately if you need the generated policy refreshed.
+## Native processing and outputs
 
-Supported custom RPZ syntax includes literal and wildcard hostname `CNAME .` routing and `CNAME rpz-passthru.` exceptions. Wildcards affect classification and downloaded-name coverage; the checker does not invent an apex hostname for a wildcard. Other record types and special RPZ IP triggers produce warnings.
+[`parse.sh`](https://github.com/GubernievS/AntiZapret-VPN/blob/aabea42bb51520371c8afc2b9b82cc6966068660/setup/root/antizapret/parse.sh) creates working files under `temp/` and then generated files under `result/`.
 
-The inventory contains names, not a packet capture or a complete DNS query history. Full VPN and catch-all policies can carry arbitrary destinations; parent and wildcard rules cover unlisted children, and IP routes can carry services with no listed hostname. These cannot be exhaustively enumerated from static lists. Adblock/deny lists describe rejected DNS traffic and are not treated as routed-domain inputs.
+1. Native host-list inputs have whitespace removed, leading punctuation/comment lines discarded, native path/comment suffixes cut off, and case normalized. `.` is retained only for normal/WARP include lists.
+2. `download/*domain.txt` names are stripped of edge punctuation, restricted to the upstream character/label format, and converted to IDNA/Punycode.
+3. Normal includes are combined with `config/*include-hosts.txt` and bundled/custom download includes. `CLEAR_HOSTS` optionally removes matching categories/keywords. The parser sorts and deduplicates the combined input.
+4. Exact removal-list entries are removed. Selected `www`/`hd`/numeric subdomain prefixes are normalized; parent rules compress redundant children. Normal exclusions participate in compression and are removed from the final normal include list.
+5. WARP includes and WARP exclusions are normalized and deduplicated into separate files. Their exceptions are represented in the generated RPZ policy rather than assuming an include file alone describes the complete route.
+6. Host rules are expanded into paired exact and wildcard RPZ records; custom RPZ records are appended. Generated policies are copied to `/etc/knot-resolver/` when changed. The native parser may clear DNS caches and perform its usual service/network operations. The checker never invokes it.
 
-Each check still runs from the client VPS's direct egress using public IPv4 DNS and HTTPS HEAD on port 443. It does not reproduce the user's full VPN path, test the donor, follow redirects, or establish that all website features work.
+| Generated file | What native AntiZapret writes |
+| --- | --- |
+| `result/include-hosts.txt` | Normal routing rules after native filtering/compression; may contain a catch-all or single-label suffix |
+| `result/exclude-hosts.txt` | Normal exception rules after native removal processing |
+| `result/include-warp-hosts.txt` | Normalized/deduplicated WARP include rules |
+| `result/exclude-warp-hosts.txt` | Normalized/deduplicated WARP exceptions from user configuration |
+| `result/proxy.rpz` | Normal routing rules, passthru exceptions, and appended custom proxy RPZ records |
+| `result/warp.rpz` | WARP routing and exceptions, optionally based on the normal proxy policy according to the native WARP mode |
+| `result/warp2.rpz` | Full-VPN WARP policy when enabled, otherwise an empty file |
+| `result/route-ips.txt` | Generated CIDR routes; their hostnames cannot be inferred exhaustively |
+| `result/deny*.rpz`, adblock host files | DNS blocking policy, not routed-host target inventory |
+
+## Checker inventory in 0.4
+
+Generated RPZ policies take precedence over the host lists they encode. If the corresponding RPZ is unavailable, generated native include/exclude lists supply coverage. A newer source file is not merged into an existing generated policy as though it were already active.
+
+The checker validates and normalizes probe hostnames, deduplicates the union by ASCII IDNA name, filters generated candidates against effective routing, and retains explicit user additions with pending provenance where necessary. Custom RPZ support includes literal/wildcard hostname `CNAME .` policies and `CNAME rpz-passthru.` exceptions. Unsupported or malformed records are reported.
+
+This coverage concerns generated proxy/WARP routing. The inventory does not model the precedence of earlier client-facing deny/custom DNS policies or subtract their overlapping names, so `active_routed_domains` is not proof that those policies permit a hostname. The native real-answer listener still applies its active policies; DNS-error outcomes remain inconclusive.
+
+Raw registry expansion is disabled by default. With `--include-download`, known downloaded children of routed parents are considered separately, with effective routing and exact removal checks. This opt-in mode can add substantial work under broad suffix rules. When no generated results exist, source fallback is clearly reported; it cannot reproduce every setup-dependent native filter.
+
+Valid suffixes and wildcards supply coverage, not invented probe targets. Catch-all/full-VPN/IP rules cannot enumerate every possible hostname. See [the audit findings](audit-v0.4.md) for count accounting and corrected behavior.
+
+## Native DNS path
+
+Relevant installed source files:
+
+| File | Role |
+| --- | --- |
+| `/etc/knot-resolver/kresd.conf` | Selects DNS groups and defines Knot instances/listeners/policies |
+| `/etc/knot-resolver/dns.lua` | Defines resolver endpoint groups and ports |
+| `/etc/knot-resolver/custom3.lua` | Custom policy for the real-answer proxy DNS instance |
+| `/root/antizapret/proxy.py` | Native proxy's default real-answer DNS target: `127.3.3.3:53` |
+| `/usr/lib/knot-resolver/kres_modules/fallback.lua` | Active fallback resolver action when loaded by the proxy DNS instance |
+
+Upstream templates: [Knot configuration](https://github.com/GubernievS/AntiZapret-VPN/blob/main/setup/etc/knot-resolver/kresd.conf), [DNS groups](https://github.com/GubernievS/AntiZapret-VPN/blob/main/setup/etc/knot-resolver/dns.lua), [proxy](https://github.com/GubernievS/AntiZapret-VPN/blob/main/setup/root/antizapret/proxy.py), and [fallback module](https://github.com/GubernievS/AntiZapret-VPN/blob/main/setup/usr/lib/knot-resolver/kres_modules/fallback.lua).
+
+The native proxy sends real-address DNS queries to Knot instance `@3`, listening on `127.3.3.3:53`. That instance loads `custom3.lua`, its configured DNS actions, and applicable fallback/deny/renumber policy. Client-facing AntiZapret DNS may return fake routing IPs, so it is not interchangeable with the real-answer listener for HTTPS destination checks.
+
+The checker statically discovers the selected `proxy_dns` action and literal endpoint lists, following the template's selected-group mapping. It queries the local listener as reference, and every applicable selected/custom/fallback endpoint as a direct comparison. It does not query unused groups merely because their definitions exist in `dns.lua`. Configured ports are preserved. Unknown active custom expressions fail clearly rather than being executed or silently ignored.
+
+These direct comparisons do not reproduce Knot's process identity or every egress rule. In particular, DNS_WARP may route Knot's UID differently from root. The local reference retains Knot's actual DNS policy path; the checker records direct comparisons separately. Discovery reflects saved supported configuration, not proof of running service state or arbitrary runtime overrides.
+
+The previous hardcoded Cloudflare DNS-JSON lookup has been removed from the default. Explicit numeric UDP/TCP/TLS endpoints or an explicit legacy DoH URL remain available as reported overrides. Domain resolution never silently switches to system DNS or an unconfigured provider.

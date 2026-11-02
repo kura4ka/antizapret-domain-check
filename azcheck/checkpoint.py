@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,7 @@ from .domains import InventoryEntry
 from .scanner import classify
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CURRENT_DECISION = ("CASE WHEN targets.excluded = 1 THEN 'excluded' "
                     "WHEN targets.included = 1 THEN 'already_warp' "
                     "ELSE results.base_decision END")
@@ -22,6 +23,43 @@ CURRENT_DECISION = ("CASE WHEN targets.excluded = 1 THEN 'excluded' "
 
 def _timestamp():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _encode_probe_context(context):
+    """Return a stable finite JSON object and its hash without echoing values."""
+    if not isinstance(context, dict):
+        raise ValueError('Probe context must be a JSON object with string keys and finite values.')
+
+    def validate(value):
+        if isinstance(value, dict):
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError('Probe context must use string object keys.')
+            for child in value.values():
+                validate(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                validate(child)
+
+    try:
+        validate(context)
+        encoded = json.dumps(context, sort_keys=True, separators=(',', ':'),
+                             ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError('Probe context must be a JSON object with string keys and finite values.') from exc
+    return encoded, hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _decode_probe_context(encoded, fingerprint):
+    if not encoded and not fingerprint:
+        return None
+    try:
+        context = json.loads(encoded)
+        canonical, expected = _encode_probe_context(context)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise RuntimeError('Scan checkpoint contains invalid probe context.') from exc
+    if canonical != encoded or expected != fingerprint:
+        raise RuntimeError('Scan checkpoint contains inconsistent probe context.')
+    return context
 
 
 class ScanCheckpoint:
@@ -34,6 +72,8 @@ class ScanCheckpoint:
     def __init__(self, report_dir):
         self.path = Path(report_dir) / 'checkpoint.sqlite3'
         self._connection = None
+        self._context_changed = False
+        self._reset_reason = ''
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._connection = sqlite3.connect(str(self.path), timeout=5)
@@ -56,9 +96,13 @@ class ScanCheckpoint:
                             completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
                             batch_index INTEGER NOT NULL CHECK (batch_index >= 0),
                             pause_until REAL NOT NULL,
-                            pause_reason TEXT NOT NULL
+                            pause_reason TEXT NOT NULL,
+                            probe_context_json TEXT NOT NULL DEFAULT '',
+                            probe_context_sha256 TEXT NOT NULL DEFAULT ''
                         );
-                        INSERT INTO state VALUES (1, '', '', 0, 0, 0, '');
+                        INSERT INTO state (singleton, run_id, started_at, completed,
+                                           batch_index, pause_until, pause_reason)
+                        VALUES (1, '', '', 0, 0, 0, '');
                         CREATE TABLE targets (
                             domain TEXT PRIMARY KEY,
                             sources_json TEXT NOT NULL,
@@ -72,8 +116,26 @@ class ScanCheckpoint:
                             result_json TEXT NOT NULL
                         );
                         CREATE INDEX results_decision ON results (base_decision, domain);
-                        PRAGMA user_version = 1;
+                        PRAGMA user_version = 2;
                     ''')
+            elif version == 1 and tables == {'state', 'targets', 'results'}:
+                # Validate the published v0.3 schema before changing it. Schema
+                # changes share one explicit transaction so failure rolls back.
+                self._connection.execute('''
+                    SELECT singleton, run_id, started_at, completed, batch_index,
+                           pause_until, pause_reason FROM state LIMIT 0
+                ''')
+                self._connection.execute('SELECT domain, sources_json, included, excluded FROM targets LIMIT 0')
+                self._connection.execute('SELECT domain, base_decision, base_reason, result_json FROM results LIMIT 0')
+                self._connection.execute('BEGIN IMMEDIATE')
+                try:
+                    self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_json TEXT NOT NULL DEFAULT ''")
+                    self._connection.execute("ALTER TABLE state ADD COLUMN probe_context_sha256 TEXT NOT NULL DEFAULT ''")
+                    self._connection.execute('PRAGMA user_version = 2')
+                    self._connection.commit()
+                except BaseException:
+                    self._connection.rollback()
+                    raise
             elif version != SCHEMA_VERSION or tables != {'state', 'targets', 'results'}:
                 raise RuntimeError('Checkpoint has an unsupported or incomplete database schema: ' + str(self.path))
             # Detect missing columns or state instead of recreating a broken store.
@@ -119,20 +181,25 @@ class ScanCheckpoint:
         with self._transaction('read') as connection:
             rows = connection.execute('''
                 SELECT singleton, run_id, started_at, completed, batch_index,
-                       pause_until, pause_reason FROM state
+                       pause_until, pause_reason, probe_context_json,
+                       probe_context_sha256 FROM state
             ''').fetchall()
         if len(rows) != 1 or rows[0][0] != 1:
             raise RuntimeError('Scan checkpoint has invalid run state: ' + str(self.path))
-        _, run_id, started_at, completed, batch_index, pause_until, pause_reason = rows[0]
+        (_, run_id, started_at, completed, batch_index, pause_until, pause_reason,
+         probe_context_json, probe_context_sha256) = rows[0]
         if (not isinstance(run_id, str) or not isinstance(started_at, str)
                 or type(completed) is not int or completed not in (0, 1)
                 or type(batch_index) is not int or batch_index < 0
                 or not isinstance(pause_until, (int, float)) or not math.isfinite(pause_until)
-                or pause_until < 0 or not isinstance(pause_reason, str)):
+                or pause_until < 0 or not isinstance(pause_reason, str)
+                or not isinstance(probe_context_json, str) or not isinstance(probe_context_sha256, str)):
             raise RuntimeError('Scan checkpoint has invalid run state: ' + str(self.path))
+        _decode_probe_context(probe_context_json, probe_context_sha256)
         return {'run_id': run_id, 'started_at': started_at, 'completed': bool(completed),
                 'batch_index': batch_index, 'pause_until': float(pause_until),
-                'pause_reason': pause_reason}
+                'pause_reason': pause_reason, 'probe_context_json': probe_context_json,
+                'probe_context_sha256': probe_context_sha256}
 
     def _require_run(self):
         state = self._state()
@@ -140,23 +207,46 @@ class ScanCheckpoint:
             raise RuntimeError('Prepare the scan checkpoint before saving or completing a batch.')
         return state
 
-    def prepare(self, inventory, restart=False):
-        """Refresh current targets; preserve completed results of an active run."""
+    def prepare(self, inventory, restart=False, probe_context=None):
+        """Resume compatible outcomes or start fresh after probe/DNS changes.
+
+        Omitting context preserves the legacy API. Production callers supply
+        their complete semantic probe context so unrecorded legacy checks and
+        incompatible results cannot silently count as completed work.
+        """
         state = self._state()
-        new_run = bool(restart or state['completed'] or not state['run_id'])
+        encoded, fingerprint = state['probe_context_json'], state['probe_context_sha256']
+        if probe_context is not None:
+            encoded, fingerprint = _encode_probe_context(probe_context)
+        context_changed = bool(state['run_id'] and probe_context is not None
+                               and fingerprint != state['probe_context_sha256'])
+        new_run = bool(restart or state['completed'] or not state['run_id'] or context_changed)
+        reset_reason = ''
+        if restart:
+            reset_reason = 'Explicit restart requested.'
+        elif context_changed:
+            reset_reason = ('DNS/probe context changed.' if state['probe_context_sha256']
+                            else 'Previous checks have no recorded DNS/probe context.')
+        elif state['completed']:
+            reset_reason = 'The previous run completed; starting fresh checks.'
+        elif not state['run_id']:
+            reset_reason = 'Starting the first scan run.'
         with self._transaction('prepare') as connection:
             if new_run:
                 connection.execute('DELETE FROM results')
                 connection.execute('''
                     UPDATE state SET run_id = ?, started_at = ?, completed = 0,
-                                     batch_index = 0 WHERE singleton = 1
-                ''', (str(uuid.uuid4()), _timestamp()))
+                                     batch_index = 0, probe_context_json = ?,
+                                     probe_context_sha256 = ? WHERE singleton = 1
+                ''', (str(uuid.uuid4()), _timestamp(), encoded, fingerprint))
             connection.execute('DELETE FROM targets')
             connection.executemany('''
                 INSERT OR IGNORE INTO targets (domain, sources_json, included, excluded)
                 VALUES (?, ?, ?, ?)
             ''', ((entry.domain, json.dumps(entry.sources, ensure_ascii=True, allow_nan=False),
                    int(entry.included), int(entry.excluded)) for entry in inventory.entries))
+        self._context_changed = context_changed
+        self._reset_reason = reset_reason
         return new_run
 
     def pending_entries(self, inventory):
@@ -292,6 +382,10 @@ class ScanCheckpoint:
 
     def info(self):
         state = self._state()
+        state['probe_context'] = _decode_probe_context(state.pop('probe_context_json'),
+                                                      state['probe_context_sha256'])
+        state['context_changed'] = self._context_changed
+        state['reset_reason'] = self._reset_reason
         with self._transaction('read') as connection:
             state['total'] = connection.execute('SELECT COUNT(*) FROM targets').fetchone()[0]
         state['completed_count'] = self.completed_count()

@@ -64,7 +64,7 @@ class InventoryTests(unittest.TestCase):
         self.write("download/include-warp-hosts.txt", "default-warp.example\n")
         user = self.root / "users.txt"
         user.write_text("# users\nhttps://Example.com/a # duplicate\nUSER.example\n", encoding="utf-8")
-        inventory = load_inventory(self.az, [user], ["extra.example", "example.com"])
+        inventory = load_inventory(self.az, [user], ["extra.example", "example.com"], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertEqual(list(entries), ["custom.example", "default-warp.example", "downloaded.example", "example.com", "extra.example", "relay.example", "user.example", "warp.example"])
         self.assertEqual(entries["example.com"].sources, sorted([
@@ -81,7 +81,7 @@ class InventoryTests(unittest.TestCase):
         self.write("download/custom-include-warp-hosts.txt", "other-warp.example\n")
         without = load_inventory(self.az, [], ["child.default.example"], include_download=False)
         self.assertEqual([entry.domain for entry in without.entries], ["child.default.example"])
-        self.assertTrue(without.entries[0].included)
+        self.assertFalse(without.entries[0].included)
         with_download = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in with_download.entries], [
             "blocked.example", "default.example", "other-warp.example", "other.example",
@@ -106,18 +106,18 @@ class InventoryTests(unittest.TestCase):
             "# comment\n! ignored\n\n EXAMPLE.com # comment\nspace .example\n"
             "path.example/unused\nпример.рф\n.\nhttps://url.example/\nbad..example\n"
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], [
             "example.com", "path.example", "space.example", "xn--e1afmkfd.xn--p1ai",
         ])
         self.assertEqual(sum('skipped invalid' in warning for warning in inventory.warnings), 2)
-        self.assertTrue(any(f"{path.as_posix()}:8" in warning and "catch-all" in warning for warning in inventory.warnings))
+        self.assertTrue(any("Catch-all routing" in warning for warning in inventory.warnings))
 
     def test_native_tld_rules_classify_children_without_becoming_probe_targets(self):
         self.write("config/include-hosts.txt", "example.com\nsub.example.com\nelsewhere.net\nCOM\n")
         self.write("download/include-warp-hosts.txt", "com\nрф\n")
         self.write("config/exclude-warp-hosts.txt", "com\n")
-        inventory = load_inventory(self.az, [], ["пример.рф", "example.com.evil.net"])
+        inventory = load_inventory(self.az, [], ["пример.рф", "example.com.evil.net"], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertNotIn("com", entries)
         self.assertNotIn("xn--p1ai", entries)
@@ -129,7 +129,7 @@ class InventoryTests(unittest.TestCase):
         self.assertFalse(entries["xn--e1afmkfd.xn--p1ai"].excluded)
         self.assertFalse(entries["elsewhere.net"].included)
         self.assertFalse(entries["example.com.evil.net"].excluded)
-        self.assertTrue(any("suffix rule 'com'" in warning for warning in inventory.warnings))
+        self.assertGreater(inventory.metadata["valid_suffix_policy_occurrences"], 0)
 
     def test_native_tld_include_rules_do_not_allow_single_label_user_submissions(self):
         self.write("config/include-warp-hosts.txt", "com\n")
@@ -146,7 +146,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(inventory.entries), 2)
         self.assertTrue(all(entry.included for entry in inventory.entries))
         self.assertTrue(inventory.entries[0].excluded)
-        self.assertTrue(any('catch-all' in warning for warning in inventory.warnings))
+        self.assertTrue(any('Catch-all' in warning for warning in inventory.warnings))
 
     def test_user_bom_comments_url_fragments_and_duplicate_files(self):
         user = self.root / "users.txt"
@@ -154,6 +154,13 @@ class InventoryTests(unittest.TestCase):
         inventory = load_inventory(self.az, [user, user], [])
         self.assertEqual([entry.domain for entry in inventory.entries], ["example.com", "xn--e1afmkfd.xn--p1ai"])
         self.assertEqual(inventory.entries[0].sources, [f"{user.as_posix()}:2"])
+        sources = [source for source in inventory.metadata['source_stats'] if source['path'] == user.as_posix()]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]['lines'], 3)
+        self.assertEqual(sources[0]['valid_entries'], 2)
+        self.assertEqual(sources[0]['unique_hostnames'], 2)
+        self.assertEqual(sources[0]['added_unique'], 2)
+        self.assertEqual(sources[0]['duplicate_targets'], 0)
 
     def test_missing_invalid_and_oversized_user_files_fail_explicitly(self):
         with self.assertRaises(DomainError):
@@ -192,7 +199,7 @@ class InventoryTests(unittest.TestCase):
         ))
         self.write('download/antifilter-download-domain.txt', 'other.example.com\n')
         self.write('config/include-hosts.txt', 'new-user.example\n')
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertEqual(set(entries), {'example.com', 'warp.example', 'www.example.com',
                                        'deep.example.com', 'child.warp.example',
@@ -216,7 +223,7 @@ class InventoryTests(unittest.TestCase):
         self.write('download/remove-hosts.txt', 'removed.example\n')
         self.write('config/exclude-hosts.txt', 'direct.example\n')
         self.write('config/include-hosts.txt', 'new.example\n')
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['keep.example', 'new.example'])
         self.assertEqual(inventory.metadata['coverage'], 'source-fallback')
         self.assertTrue(any('source lists' in warning for warning in inventory.warnings))
@@ -226,7 +233,7 @@ class InventoryTests(unittest.TestCase):
             '"Example.COM"\n*.пример.рф.\nhttps://ignored.example/path\n'
             'not a domain.example\n127.0.0.1\n'
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['example.com', 'xn--e1afmkfd.xn--p1ai'])
         self.assertTrue(any('invalid registry' in warning for warning in inventory.warnings))
 
@@ -239,9 +246,11 @@ class InventoryTests(unittest.TestCase):
         self.write('config/custom-proxy-rpz.txt', 'new-policy.example 60 IN CNAME .\n')
         self.write('config/warp-rpz.txt', ('api.example CNAME .\n*.warp.example CNAME .\n'
                                          'direct.warp.example CNAME rpz-passthru.\n'))
+        self.write('result/warp.rpz', ('api.example CNAME .\n*.warp.example CNAME .\n'
+                                      'direct.warp.example CNAME rpz-passthru.\n'))
         self.write('download/bol-van-domain.txt', ('child.wild.example\ndirect.wild.example\n'
                                                   'wild.example\nchild.warp.example\n'))
-        inventory = load_inventory(self.az, [], ['direct.warp.example'])
+        inventory = load_inventory(self.az, [], ['direct.warp.example'], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertEqual(set(entries), {'literal.example', 'new-policy.example', 'api.example',
                                        'child.wild.example', 'child.warp.example', 'direct.warp.example'})
@@ -255,7 +264,7 @@ class InventoryTests(unittest.TestCase):
         path = self.write('config/proxy-rpz.txt', ('$ORIGIN example.com.\n'
                                                   'login IN CNAME .\n*.assets CNAME .\n'
                                                   'bad A 127.0.0.1\n32.4.3.2.1.rpz-ip CNAME .\n'))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['login.example.com'])
         self.assertTrue(any(path.as_posix() in warning and '2 unsupported RPZ' in warning for warning in inventory.warnings))
 
@@ -272,7 +281,7 @@ class InventoryTests(unittest.TestCase):
             'service.goog\nprivate.goog\nservice.google\nservice.ua\n'
             'пример.рф\nunrouted.example\n'
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertEqual(set(entries), {
             'service.goog', 'private.goog', 'service.google', 'service.ua',
@@ -299,7 +308,7 @@ class InventoryTests(unittest.TestCase):
         self.write('download/bol-van-domain.txt', (
             'child.google\ndirect.google\nchild.goog\nprivate.goog\nsite.ua\n'
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertEqual(set(entries), {
             'login.google', 'child.google', 'login.goog', 'child.goog', 'site.ua',
@@ -316,7 +325,7 @@ class InventoryTests(unittest.TestCase):
             '123 CNAME .\n*.123 CNAME .\nbad_name CNAME .\n'
             '$ORIGIN 123.\nvalid.example CNAME .\n'
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['valid.example'])
         self.assertTrue(any(path.as_posix() in warning and '4 unsupported RPZ' in warning
                             for warning in inventory.warnings))
@@ -330,10 +339,10 @@ class InventoryTests(unittest.TestCase):
         self.write('result/proxy.rpz', '*. CNAME .\n')
         self.write('result/route-ips.txt', '93.184.215.0/24\n')
         self.write('download/bol-van-domain.txt', 'known.example\n')
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['known.example'])
         self.assertTrue(any('Catch-all routing' in warning for warning in inventory.warnings))
-        self.assertTrue(any('IP/CIDR' in warning for warning in inventory.warnings))
+        self.assertTrue(any('IP/CIDR' in notice for notice in inventory.metadata['notices']))
 
     def test_adblock_and_deny_policies_are_not_route_inputs(self):
         self.write('download/oisd-include-adblock-hosts.txt', 'adblock.example\n')
@@ -356,7 +365,7 @@ class InventoryTests(unittest.TestCase):
             'child.routed.example\ndirect.routed.example\n'
             'deep.direct.routed.example\nother.example\n'
         ))
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], [
             'child.routed.example', 'deep.direct.routed.example',
         ])
@@ -366,11 +375,12 @@ class InventoryTests(unittest.TestCase):
         self.write('result/include-warp-hosts.txt', 'active.example\n')
         self.write('download/include-warp-hosts.txt', 'pending.example\nactive.example\n')
         self.write('config/include-warp-hosts.txt', 'user-pending.example\n')
-        inventory = load_inventory(self.az, [], ['pending.example'])
+        inventory = load_inventory(self.az, [], ['pending.example'], include_download=True)
         entries = {entry.domain: entry for entry in inventory.entries}
         self.assertFalse(entries['pending.example'].included)
         self.assertTrue(entries['active.example'].included)
-        self.assertTrue(entries['user-pending.example'].included)
+        self.assertFalse(entries['user-pending.example'].included)
+        self.assertIn('user-pending.example', inventory.metadata['pending_config_domains'])
         self.assertEqual(entries['pending.example'].sources, ['--domain:1'])
         self.assertEqual(inventory.metadata['downloaded_entries_omitted'], 1)
 
@@ -380,9 +390,126 @@ class InventoryTests(unittest.TestCase):
         self.write('download/include-hosts.txt', 'unparsed.example\n')
         self.write('download/include-warp-hosts.txt', 'unparsed-warp.example\n')
         self.write('download/bol-van-domain.txt', 'child.active.example\nunrouted.example\n')
-        inventory = load_inventory(self.az, [], [])
+        inventory = load_inventory(self.az, [], [], include_download=True)
         self.assertEqual([entry.domain for entry in inventory.entries], ['child.active.example', 'warp.example'])
         self.assertEqual(inventory.metadata['coverage'], 'parsed-and-source')
+
+    def test_default_inventory_does_not_expand_raw_registries(self):
+        self.write('result/include-hosts.txt', 'example.com\n')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('download/bol-van-domain.txt', 'child.example.com\nother.example.com\n')
+        inventory = load_inventory(self.az, [], [])
+        self.assertEqual([entry.domain for entry in inventory.entries], ['example.com'])
+        self.assertFalse(inventory.metadata['include_download'])
+        self.assertEqual(inventory.metadata['registry_files'], [])
+        self.assertEqual(inventory.metadata['unique_contributions'], {'generated_host_lists': 1})
+
+    def test_generated_passthru_filters_native_targets_and_new_source_exclusions_do_not_override_it(self):
+        self.write('result/include-hosts.txt', 'normal.example\ndirect.example\n')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('result/proxy.rpz', ('normal.example CNAME .\n*.normal.example CNAME .\n'
+                                         'direct.example CNAME .\n*.direct.example CNAME .\n'
+                                         'direct.example CNAME rpz-passthru.\n*.direct.example CNAME rpz-passthru.\n'))
+        self.write('config/exclude-hosts.txt', 'normal.example\n')
+        self.write('download/exclude-hosts.txt', 'normal.example\n')
+        self.write('download/bol-van-domain.txt', 'child.normal.example\nchild.direct.example\n')
+        inventory = load_inventory(self.az, [], [], include_download=True)
+        self.assertEqual([entry.domain for entry in inventory.entries], ['child.normal.example', 'normal.example'])
+        stats = {record['path']: record for record in inventory.metadata['source_stats']}
+        native = stats[(self.az / 'result/include-hosts.txt').as_posix()]
+        self.assertEqual(native['added_unique'], 1)
+        self.assertEqual(native['filtered_entries'], 1)
+        self.assertEqual(sum(inventory.metadata['unique_contributions'].values()), len(inventory.entries))
+
+    def test_unparsed_config_routes_remain_pending_without_expanding_registry_coverage(self):
+        self.write('result/include-hosts.txt', 'active.example\n')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('result/proxy.rpz', 'active.example CNAME .\n*.active.example CNAME .\n')
+        self.write('result/warp.rpz', '')
+        self.write('config/include-hosts.txt', 'pending.example\n')
+        self.write('config/warp-rpz.txt', 'pending-warp.example CNAME .\n*.pending-warp.example CNAME .\n')
+        self.write('download/bol-van-domain.txt', 'child.pending.example\nchild.pending-warp.example\n')
+        inventory = load_inventory(self.az, [], [], include_download=True)
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {'active.example', 'pending.example', 'pending-warp.example'})
+        self.assertFalse(entries['pending-warp.example'].included)
+        self.assertEqual(inventory.metadata['pending_config_domains'], ['pending-warp.example', 'pending.example'])
+        self.assertEqual(inventory.metadata['active_routed_domains'], 1)
+
+    def test_warp_exclusion_does_not_remove_a_normally_routed_domain(self):
+        self.write('result/include-hosts.txt', 'normal.example\n')
+        self.write('result/include-warp-hosts.txt', 'warp.example\n')
+        self.write('result/exclude-warp-hosts.txt', 'normal.example\n')
+        self.write('config/exclude-warp-hosts.txt', 'normal.example\n')
+        inventory = load_inventory(self.az, [], [])
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertIn('normal.example', entries)
+        self.assertTrue(entries['normal.example'].excluded)
+
+    def test_more_specific_generated_warp_routes_override_parent_passthru(self):
+        self.write('result/include-hosts.txt', '')
+        self.write('result/include-warp-hosts.txt', 'direct.example\nchild.direct.example\n')
+        self.write('result/warp.rpz', ('*.example CNAME .\n'
+                                       'direct.example CNAME rpz-passthru.\n'
+                                       '*.direct.example CNAME rpz-passthru.\n'
+                                       'child.direct.example CNAME .\n'))
+        inventory = load_inventory(self.az, [], [])
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {'child.direct.example'})
+        self.assertTrue(entries['child.direct.example'].included)
+        self.assertFalse(entries['child.direct.example'].excluded)
+
+    def test_invalid_and_suffix_entries_do_not_inflate_deduplicated_union_or_stats(self):
+        self.write('result/include-hosts.txt', 'EXAMPLE.com\nexample.com\ngoog\nbad..example\n')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('result/proxy.rpz', ('example.com CNAME .\n*.example.com CNAME .\n'
+                                        'goog CNAME .\n*.goog CNAME .\nbad..example CNAME .\n'))
+        self.write('config/include-hosts.txt', 'example.com\nnew.example\n')
+        self.write('download/bol-van-domain.txt', 'child.example.com\nchild.example.com\nunrouted.example\n')
+        inventory = load_inventory(self.az, [], [], include_download=True)
+        self.assertEqual([entry.domain for entry in inventory.entries], ['child.example.com', 'example.com', 'new.example'])
+        self.assertEqual(inventory.metadata['total_unique_domains'], 3)
+        self.assertEqual(sum(inventory.metadata['unique_contributions'].values()), 3)
+        self.assertEqual(inventory.metadata['valid_suffix_policy_occurrences'], 3)
+        self.assertEqual(inventory.metadata['invalid_source_entries'], 2)
+        self.assertFalse(any('suffix rule' in warning for warning in inventory.warnings))
+        stats = {Path(record['path']).name: record for record in inventory.metadata['source_stats']}
+        registry = stats['bol-van-domain.txt']
+        self.assertEqual(registry['valid_entries'], 3)
+        self.assertEqual(registry['unique_hostnames'], 2)
+        self.assertEqual(registry['added_unique'], 1)
+        self.assertEqual(registry['duplicate_targets'], 1)
+        self.assertEqual(registry['filtered_entries'], 1)
+
+    def test_native_unicode_separators_keep_full_hostname_validation(self):
+        self.write('config/include-hosts.txt', 'EXAMPLE。COM\nexample。123\n')
+        inventory = load_inventory(self.az, [], [])
+        self.assertEqual([entry.domain for entry in inventory.entries], ['example.com'])
+        self.assertEqual(inventory.metadata['invalid_source_entries'], 1)
+
+    def test_registry_ascii_punctuation_matches_upstream_and_exclude_dot_is_ignored(self):
+        self.write('result/include-hosts.txt', 'example.com\n')
+        self.write('result/include-warp-hosts.txt', '')
+        self.write('config/exclude-warp-hosts.txt', '.\n')
+        self.write('download/bol-van-domain.txt', '__child.example.com__\n')
+        inventory = load_inventory(self.az, [], [], include_download=True)
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {'example.com', 'child.example.com'})
+        self.assertFalse(entries['example.com'].excluded)
+        self.assertEqual(inventory.metadata['invalid_source_entries'], 0)
+
+    def test_missing_one_generated_policy_does_not_promote_other_config_sources_to_active(self):
+        self.write('result/include-hosts.txt', 'normal.example\n')
+        self.write('config/include-warp-hosts.txt', 'pending-warp.example\n')
+        self.write('config/warp-rpz.txt', 'pending-policy.example CNAME .\n')
+        self.write('download/bol-van-domain.txt', 'child.pending-warp.example\n')
+        inventory = load_inventory(self.az, [], [], include_download=True)
+        entries = {entry.domain: entry for entry in inventory.entries}
+        self.assertEqual(set(entries), {'normal.example', 'pending-warp.example', 'pending-policy.example'})
+        self.assertFalse(entries['pending-warp.example'].included)
+        self.assertFalse(entries['pending-policy.example'].included)
+        self.assertEqual(inventory.metadata['pending_config_count'], 2)
+        self.assertEqual(inventory.metadata['active_routed_domains'], 1)
 
 
 if __name__ == "__main__":

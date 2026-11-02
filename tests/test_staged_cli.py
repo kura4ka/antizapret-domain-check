@@ -56,6 +56,8 @@ class StagedCLITests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr), \
              patch('azcheck.cli.shutil.which', return_value='curl'), \
+             patch('azcheck.cli.dns_plan', return_value={'mode': 'explicit-doh',
+                   'resolver_url': 'https://1.1.1.1/dns-query', 'upstreams': [], 'warnings': []}), \
              patch('azcheck.cli.scan_inventory', side_effect=scanner or self.synthetic_scan), \
              patch('azcheck.checkpoint.time.time', side_effect=lambda: self.clock.now), \
              patch('azcheck.cli.time.sleep', side_effect=self.clock.sleep):

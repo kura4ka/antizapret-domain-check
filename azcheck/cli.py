@@ -6,23 +6,27 @@ import math
 from pathlib import Path
 import shutil
 import sys
+import threading
 import time
 
 from . import __version__
 from .checkpoint import ScanCheckpoint
+from .audit import refresh_suggestions, write_inventory_audit
 from .domains import DomainError, Inventory, load_inventory
-from .probe import ProbeError, validate_resolver_url, validate_timeout
-from .scanner import report_lock, scan_inventory, write_reports
+from .probe import ProbeError, check_domain, validate_resolver_url, validate_timeout
+from .resolvers import applicable_resolvers, discover_resolvers, parse_resolver
+from .scanner import _Pacer, report_lock, scan_inventory, write_reports
 
 
 DEFAULT_CONFIG = '/etc/antizapret-domain-check/config.json'
 LEGACY_REPORT_DIR = '/var/lib/antizapret-domain-check/reports'
-DEFAULTS = {'config_version': 3, 'antizapret_dir': '/root/antizapret',
+DEFAULTS = {'config_version': 4, 'antizapret_dir': '/root/antizapret',
             'report_dir': '/root/antizapret-domain-check/reports',
             'timeout_seconds': 8, 'attempts': 2, 'workers': 2,
-            'interval_seconds': 0.5, 'include_download': True,
+            'interval_seconds': 0.5, 'include_download': False,
             'batch_size': 500, 'batch_pause_seconds': 300,
-            'resolver_url': 'https://1.1.1.1/dns-query'}
+            'resolver_url': '', 'resolvers': [], 'dns_config_dir': '/etc/knot-resolver',
+            'dns_interval_seconds': 0.25}
 
 
 def _duration(seconds):
@@ -49,9 +53,11 @@ def migrate_config(document):
     if not isinstance(document, dict) or set(document) - set(DEFAULTS):
         raise ValueError('Configuration contains unknown settings or is not an object.')
     version = document.get('config_version', 1)
-    if type(version) is not int or version not in (1, 2, 3):
-        raise ValueError('config_version must be 1, 2 or 3.')
+    if type(version) is not int or version not in (1, 2, 3, 4):
+        raise ValueError('config_version must be 1, 2, 3 or 4.')
     upgraded = dict(document)
+    if 'include_download' in document and type(document['include_download']) is not bool:
+        raise ValueError('include_download must be true or false.')
     if version == 1:
         if upgraded.get('report_dir') == LEGACY_REPORT_DIR:
             upgraded['report_dir'] = DEFAULTS['report_dir']
@@ -61,7 +67,15 @@ def migrate_config(document):
     if version < 3:
         for key in ('batch_size', 'batch_pause_seconds'):
             upgraded.setdefault(key, DEFAULTS[key])
-    upgraded['config_version'] = 3
+    if version < 4:
+        # Earlier releases enabled raw expansion and a fixed Cloudflare URL by
+        # default. Migrate those defaults to effective lists and native DNS.
+        upgraded['include_download'] = False
+        if upgraded.get('resolver_url') == 'https://1.1.1.1/dns-query':
+            upgraded['resolver_url'] = ''
+        for key in ('resolvers', 'dns_config_dir', 'dns_interval_seconds'):
+            upgraded.setdefault(key, DEFAULTS[key])
+    upgraded['config_version'] = 4
     return upgraded
 
 
@@ -79,12 +93,18 @@ def load_settings(args):
                  'timeout': 'timeout_seconds', 'attempts': 'attempts', 'workers': 'workers',
                  'interval': 'interval_seconds', 'resolver_url': 'resolver_url',
                  'batch_size': 'batch_size', 'batch_pause': 'batch_pause_seconds',
+                 'resolver': 'resolvers', 'dns_config_dir': 'dns_config_dir',
+                 'dns_interval': 'dns_interval_seconds',
                  'include_download': 'include_download'}
     for flag, key in overrides.items():
         value = getattr(args, flag, None)
         if value is not None:
             settings[key] = value
-    for key in ('antizapret_dir', 'report_dir'):
+    if getattr(args, 'resolver', None) is not None:
+        settings['resolver_url'] = ''
+    elif getattr(args, 'resolver_url', None) is not None:
+        settings['resolvers'] = []
+    for key in ('antizapret_dir', 'report_dir', 'dns_config_dir'):
         if not isinstance(settings[key], str) or not settings[key] or '\x00' in settings[key]:
             raise ValueError(f'{key} must be a directory path.')
     if Path(settings['report_dir']).resolve().is_relative_to(Path(settings['antizapret_dir']).resolve()):
@@ -99,29 +119,59 @@ def load_settings(args):
     if type(settings['include_download']) is not bool:
         raise ValueError('include_download must be true or false.')
     settings['timeout_seconds'] = validate_timeout(settings['timeout_seconds'])
-    settings['resolver_url'] = validate_resolver_url(settings['resolver_url'])
+    dns_interval = settings['dns_interval_seconds']
+    if isinstance(dns_interval, bool) or not isinstance(dns_interval, (int, float)) or not math.isfinite(dns_interval) or not 0.25 <= dns_interval <= 60:
+        raise ValueError('dns_interval_seconds must be between 0.25 and 60.')
+    if settings['resolver_url']:
+        settings['resolver_url'] = validate_resolver_url(settings['resolver_url'])
+    elif not isinstance(settings['resolver_url'], str):
+        raise ValueError('resolver_url must be an HTTPS URL or an empty string for native DNS discovery.')
+    if not isinstance(settings['resolvers'], list) or any(not isinstance(value, str) for value in settings['resolvers']):
+        raise ValueError('resolvers must be a list of explicit DNS endpoint strings.')
+    if settings['resolvers'] and settings['resolver_url']:
+        raise ValueError('Choose explicit resolvers or resolver_url, not both.')
     return settings
+
+
+def dns_plan(settings):
+    if settings['resolvers']:
+        endpoints = {endpoint['id']: endpoint for endpoint in map(parse_resolver, settings['resolvers'])}
+        values = list(endpoints.values())
+        return {'mode': 'explicit', 'reference': values[0], 'upstreams': values[1:],
+                'sources': [], 'warnings': ['Explicit DNS overrides are used; native path parity is unverified.']}
+    if settings['resolver_url']:
+        return {'mode': 'explicit-doh', 'resolver_url': settings['resolver_url'], 'upstreams': [],
+                'sources': [], 'warnings': ['Explicit DoH override is used; native DNS discovery is disabled.']}
+    plan = discover_resolvers(Path(settings['antizapret_dir']), knot_dir=Path(settings['dns_config_dir']))
+    plan['mode'] = 'antizapret'
+    return plan
 
 
 def parser():
     result = argparse.ArgumentParser(description='Check AntiZapret domains from the client VPS and suggest WARP candidates.')
     result.add_argument('--version', action='version', version=__version__)
     commands = result.add_subparsers(dest='command', required=True)
-    for command in ('inventory', 'scan'):
+    for command in ('inventory', 'audit', 'scan'):
         sub = commands.add_parser(command, help='List collected domains' if command == 'inventory' else 'Check domains and write reports')
         sub.add_argument('--config', help='JSON settings file (default: ' + DEFAULT_CONFIG + ')')
         sub.add_argument('--az-dir', help='AntiZapret root (default: /root/antizapret)')
         sub.add_argument('--file', action='append', default=[], help='Also check domains from this text file; repeatable')
         sub.add_argument('--domain', action='append', default=[], help='Also check this domain; repeatable')
         sub.add_argument('--include-download', action=argparse.BooleanOptionalAction, default=None,
-                         help='Expand parsed routing lists with downloaded registries (default: enabled; may be very large)')
-        if command == 'scan':
+                         help='Opt in to raw-registry subdomain expansion (default: disabled)')
+        sub.add_argument('--dns-config-dir', help='Installed Knot configuration directory')
+        if command in ('scan', 'audit'):
             sub.add_argument('--report-dir', help='Report directory (default: ' + DEFAULTS['report_dir'] + ')')
+        if command == 'audit':
+            sub.add_argument('--compare-download', action='store_true', help='Also calculate inventory counts with raw expansion enabled')
+        if command == 'scan':
             sub.add_argument('--timeout', type=float, help='Seconds per DNS/HTTPS phase (1..60)')
             sub.add_argument('--attempts', type=int, help='Attempts for potential routing failures (2..3)')
             sub.add_argument('--workers', type=int, help='Concurrent domains (1..4)')
             sub.add_argument('--interval', type=float, help='Minimum seconds between domain attempts (0.25..60)')
             sub.add_argument('--resolver-url', help='HTTPS DNS JSON resolver URL')
+            sub.add_argument('--resolver', action='append', help='Explicit DNS endpoint, repeatable; bypasses native discovery')
+            sub.add_argument('--dns-interval', type=float, help='Minimum seconds between individual DNS queries (0.25..60)')
             sub.add_argument('--batch-size', type=int, help='Domains per stage (1..5000; default: 500)')
             sub.add_argument('--batch-pause', type=int, help='Seconds between stages (60..86400; default: 300)')
             sub.add_argument('--one-batch', action='store_true', help='Run one stage, save progress, then exit')
@@ -136,18 +186,48 @@ def main(argv=None):
         settings = load_settings(args)
         inventory = load_inventory(Path(settings['antizapret_dir']), [Path(path) for path in args.file],
                                    args.domain, settings['include_download'])
-        if args.command == 'inventory' or not args.quiet:
+        if args.command != 'scan' or not args.quiet:
             for warning in inventory.warnings:
                 print('WARNING: ' + warning, file=sys.stderr, flush=True)
+            for notice in inventory.metadata.get('notices', []):
+                print('INFO: ' + notice, file=sys.stderr, flush=True)
         if args.command == 'inventory':
             for entry in inventory.entries:
                 state = 'excluded' if entry.excluded else 'already_warp' if entry.included else 'normal'
                 print(f'{entry.domain}\t{state}\t' + ', '.join(entry.sources))
             return 0
+        if args.command == 'audit':
+            plan, dns_error = None, None
+            try:
+                plan = dns_plan(settings)
+            except (OSError, ValueError, RuntimeError) as exc:
+                dns_error = str(exc)
+            comparison = None
+            if args.compare_download:
+                expanded = load_inventory(Path(settings['antizapret_dir']), [Path(path) for path in args.file],
+                                          args.domain, True)
+                comparison = {'mode': 'raw_expansion', 'unique_count': len(expanded.entries),
+                              'unique_contributions': expanded.metadata.get('unique_contributions', {}),
+                              'source_stats': expanded.metadata.get('source_stats', []),
+                              'downloaded_entries_omitted': expanded.metadata.get('downloaded_entries_omitted', 0)}
+                del expanded
+            with report_lock(settings['report_dir']):
+                audit = write_inventory_audit(settings['report_dir'], inventory, plan, dns_error, comparison)
+            print(f"Inventory: {audit['unique_count']} unique domains; no DNS or HTTPS checks were sent.")
+            if comparison:
+                print(f"With raw expansion: {comparison['unique_count']} unique domains.")
+            print('Audit: ' + str(Path(settings['report_dir']).resolve() / 'inventory-audit.txt'))
+            if dns_error:
+                print('DNS discovery needs attention: ' + dns_error, file=sys.stderr)
+            return 0
         if not inventory.entries:
             raise ValueError('No domains found. Check --az-dir, result/include-hosts.txt and download/*domain.txt, or pass --file/--domain.')
         if not shutil.which('curl'):
             raise ValueError('curl is required. Install it before scanning.')
+        plan = dns_plan(settings)
+        inventory.metadata['dns_plan'] = plan
+        probe_context = {'probe_version': 2, 'dns': plan, 'attempts': settings['attempts'],
+                         'timeout_seconds': settings['timeout_seconds'], 'method': 'verified HTTPS HEAD IPv4'}
         if not args.quiet:
             print(f'Checking {len(inventory.entries)} domains from this VPS; donor access is unverified.', file=sys.stderr, flush=True)
             metadata = inventory.metadata
@@ -155,9 +235,25 @@ def main(argv=None):
                   f"; {len(metadata.get('native_files', []))} host lists, " +
                   f"{len(metadata.get('registry_files', []))} registry lists, " +
                   f"{len(metadata.get('rpz_files', []))} RPZ files.", file=sys.stderr, flush=True)
+            print('Unique contributions: ' + json.dumps(metadata.get('unique_contributions', {}), sort_keys=True),
+                  file=sys.stderr, flush=True)
+            print('DNS mode: ' + plan['mode'] + '; reference: ' +
+                  (plan.get('reference', {}).get('id') or plan.get('resolver_url', 'unknown')) +
+                  f"; {len(plan.get('upstreams', []))} upstream diagnostic endpoints.", file=sys.stderr, flush=True)
+            for warning in plan.get('warnings', []):
+                print('WARNING: ' + warning, file=sys.stderr, flush=True)
             minimum = max(0, len(inventory.entries) - 1) * settings['interval_seconds']
-            print('Pacing alone requires at least ' + _duration(minimum) +
-                  '; retries and DNS/HTTPS delays can make the scan longer.', file=sys.stderr, flush=True)
+            print('Fresh-run domain-attempt pacing floor: ' + _duration(minimum) +
+                  '; this excludes individual DNS pacing, batch pauses, retries and network delays. '
+                  'Saved checks reduce remaining work.', file=sys.stderr, flush=True)
+            if plan['mode'] != 'explicit-doh':
+                queries = sum(1 + sum(endpoint['id'] != plan['reference']['id']
+                                      for endpoint in applicable_resolvers(plan, entry.domain))
+                              for entry in inventory.entries)
+                dns_minimum = max(0, queries - 1) * settings['dns_interval_seconds']
+                print(f'Fresh-run DNS matrix: {queries} queries before retries; DNS pacing floor ' +
+                      _duration(dns_minimum) + '. Domain and DNS pacing overlap; batch pauses and '
+                      'network delays add time.', file=sys.stderr, flush=True)
             print(f"Stages: up to {settings['batch_size']} domains; "
                   f"{settings['batch_pause_seconds']}s pause between stages. "
                   'Completed checks are saved for resume.', file=sys.stderr, flush=True)
@@ -201,9 +297,26 @@ def main(argv=None):
             if not args.quiet:
                 print(message, file=sys.stderr, flush=True)
 
+        dns_output_lock = threading.Lock()
+
+        def dns_event(update):
+            with dns_output_lock:
+                prefix = f"DNS {update['domain']} via {update['resolver']} "
+                if update['type'] == 'dns_start':
+                    log(prefix + 'QUERY A')
+                else:
+                    answer = update['result']
+                    log(prefix + 'RESPONSE ' + answer['status'] + ' | ' + str(answer.get('rcode')) +
+                        ' | ' + ', '.join(answer.get('addresses', [])) + ' | ' + answer['detail'])
+
         report_dir = Path(settings['report_dir'])
+        dns_pacer = _Pacer(settings['dns_interval_seconds'])
         with report_lock(report_dir), ScanCheckpoint(report_dir) as checkpoint:
-            new_run = checkpoint.prepare(inventory, restart=args.restart)
+            new_run = checkpoint.prepare(inventory, restart=args.restart, probe_context=probe_context)
+            refresh_suggestions(report_dir, checkpoint)
+            write_inventory_audit(report_dir, inventory, plan)
+            if checkpoint.info().get('context_changed'):
+                log('DNS/probe configuration changed; cached checks were invalidated. Saved cooldowns still apply.')
             pending = checkpoint.pending_entries(inventory)
             initial_completed = checkpoint.completed_count()
             started = last_progress = time.monotonic()
@@ -252,10 +365,20 @@ def main(argv=None):
 
                 already_done = checkpoint.completed_count()
                 interrupted = False
+                stop_event = threading.Event()
+
+                def probe(domain, **options):
+                    return check_domain(domain, **options,
+                                        resolver_plan=None if plan['mode'] == 'explicit-doh' else plan,
+                                        dns_pacer=lambda: dns_pacer.wait(stop_event),
+                                        cancelled=stop_event.is_set,
+                                        dns_event=None if args.quiet else dns_event)
+
                 try:
                     scan_inventory(Inventory(selected, [], inventory.metadata), attempts=settings['attempts'],
                                    workers=settings['workers'], interval_seconds=settings['interval_seconds'],
                                    timeout_seconds=settings['timeout_seconds'], resolver_url=settings['resolver_url'],
+                                   probe_fn=probe, stop_event=stop_event,
                                    completed=completed,
                                    progress=None if args.quiet else lambda done, total: progress(
                                        already_done + done, len(inventory.entries)),

@@ -285,7 +285,9 @@ class ScannerTests(unittest.TestCase):
 class CLITests(unittest.TestCase):
     def run_cli(self, arguments):
         stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        with redirect_stdout(stdout), redirect_stderr(stderr), patch('azcheck.cli.dns_plan', return_value={
+            'mode': 'explicit-doh', 'resolver_url': 'https://1.1.1.1/dns-query', 'upstreams': [], 'warnings': []
+        }):
             code = cli.main(arguments)
         return code, stdout.getvalue(), stderr.getvalue()
 
@@ -313,7 +315,7 @@ class CLITests(unittest.TestCase):
             args = cli.parser().parse_args(['scan', '--config', str(config)])
             settings = cli.load_settings(args)
             self.assertEqual(settings['report_dir'], '/root/antizapret-domain-check/reports')
-            self.assertTrue(settings['include_download'])
+            self.assertFalse(settings['include_download'])
             self.assertEqual(settings['timeout_seconds'], 12)
             self.assertEqual(settings['workers'], 3)
             self.assertEqual(json.loads(config.read_text()), original, 'Runtime migration must be read-only')
@@ -343,7 +345,7 @@ class CLITests(unittest.TestCase):
                                       completed=options.get('completed'),
                                       event=options.get('event'), progress=options.get('progress'))
 
-            arguments = ['scan', '--az-dir', str(az), '--report-dir', str(root / 'reports')]
+            arguments = ['scan', '--az-dir', str(az), '--report-dir', str(root / 'reports'), '--include-download']
             with patch('azcheck.cli.scan_inventory', side_effect=synthetic_scan), patch('azcheck.cli.shutil.which', return_value='curl'):
                 code, output, error = self.run_cli(arguments)
                 self.assertEqual(code, 0, error)
@@ -377,11 +379,13 @@ class CLITests(unittest.TestCase):
              patch('azcheck.cli.shutil.which', return_value='curl'), \
              patch('azcheck.cli.time.monotonic', side_effect=[100, 161, 162, 222]), \
              patch('azcheck.cli.scan_inventory', side_effect=synthetic_scan), \
+             patch('azcheck.cli.write_inventory_audit'), \
              patch('azcheck.cli.write_reports', return_value={'counts': {}}):
             code, _, error = self.run_cli(['scan', '--report-dir', directory, '--one-batch'])
         self.assertEqual(code, 0, error)
         self.assertIn('Checking 776634 domains', error)
-        self.assertIn('Pacing alone requires at least 4d 11h', error)
+        self.assertIn('Fresh-run domain-attempt pacing floor: 4d 11h', error)
+        self.assertIn('excludes individual DNS pacing', error)
         self.assertIn('Completed checks are saved for resume.', error)
         self.assertIn('Progress: 100/776634 completed (0.01%)', error)
         self.assertIn('Progress: 200/776634 completed', error)

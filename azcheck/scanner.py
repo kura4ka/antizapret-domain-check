@@ -97,11 +97,13 @@ def scan_inventory(inventory, *, attempts=2, workers=2, interval_seconds=0.5,
             probe = dict(probe_fn(entry.domain, timeout=timeout_seconds, resolver_url=resolver_url))
             elapsed = round(max(0.0, time.monotonic() - started), 3)
             probe['elapsed_seconds'] = elapsed
-            probes.append(probe)
             if probe['status'] == 'rate_limited' or probe.get('http_status') == 429:
                 stop_event.set()
             notify({**context, 'type': 'result', 'result': dict(probe),
                     'elapsed_seconds': elapsed})
+            if probe.get('incomplete'):
+                return None
+            probes.append(probe)
             if not _possible_route_problem(probe):
                 break
         if not probes:
@@ -234,7 +236,7 @@ def write_reports(report_dir, inventory, results, *, result_count=None, counts=N
     report_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
     report = {'version': __version__, 'generated_at': stamp,
-              'scope': 'Client VPS only; public IPv4 DNS and HTTPS HEAD on port 443.',
+              'scope': 'Client VPS only; configured DNS reference and per-upstream diagnostics; verified IPv4 HTTPS HEAD on port 443.',
               'inventory': dict(inventory.metadata),
               'donor_tested': False, 'warnings': list(inventory.warnings)}
     if progress is not None:
@@ -277,6 +279,11 @@ def write_reports(report_dir, inventory, results, *, result_count=None, counts=N
                 body.write('  ' + ' | '.join(details) + '\n')
                 if check.get('detail'):
                     body.write('    ' + str(check['detail']) + '\n')
+                for dns_check in check.get('dns_checks', []):
+                    body.write('    DNS ' + str(dns_check.get('resolver', 'unknown')) + ': ' +
+                               str(dns_check.get('status', 'unknown')) + ' | ' + str(dns_check.get('rcode', '')) +
+                               ' | ' + ', '.join(dns_check.get('addresses', [])) + ' | ' +
+                               str(dns_check.get('detail', '')) + '\n')
         if result_count is not None and result_count != observed_count:
             raise ValueError('Report result_count does not match the result stream.')
         if counts is not None and dict(counts) != dict(observed_counts):

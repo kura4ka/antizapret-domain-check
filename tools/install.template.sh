@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION=0.3.0
+VERSION=0.4.0
 PROGRAM_DIR=/opt/antizapret-domain-check
 WRAPPER=/usr/local/bin/antizapret-domain-check
 CONFIG_DIR=/etc/antizapret-domain-check
@@ -45,9 +45,9 @@ install_program() (
     # shellcheck disable=SC1091
     source /etc/os-release
     [[ ${ID:-} == debian || ${ID:-} == ubuntu ]] || die 'Supported systems: Debian and Ubuntu.'
-    if [[ ! -x /usr/bin/python3 ]] || ! command -v curl >/dev/null; then
+    if [[ ! -x /usr/bin/python3 ]] || ! command -v curl >/dev/null || ! /usr/bin/python3 -c 'import dns.query' >/dev/null 2>&1; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-dnspython curl
     fi
     [[ -x /usr/bin/python3 ]] && command -v curl >/dev/null || die 'Python 3 and curl are required.'
     [[ ! -L $PROGRAM_DIR && ! -L $WRAPPER && ! -L $CONFIG_DIR && ! -L $STATE_DIR && ! -L $STATE_DIR/reports ]] || die 'An installation path is a symbolic link; resolve it before installing.'
@@ -111,17 +111,20 @@ WRAPPER_SH
     if [[ ! -e $CONFIG_DIR/config.json ]]; then
         cat > "$stage/config.json" <<'CONFIG_JSON'
 {
-  "config_version": 3,
+  "config_version": 4,
   "antizapret_dir": "/root/antizapret",
   "report_dir": "/root/antizapret-domain-check/reports",
   "timeout_seconds": 8,
   "attempts": 2,
   "workers": 2,
   "interval_seconds": 0.5,
-  "include_download": true,
+  "include_download": false,
   "batch_size": 500,
   "batch_pause_seconds": 300,
-  "resolver_url": "https://1.1.1.1/dns-query"
+  "resolver_url": "",
+  "resolvers": [],
+  "dns_config_dir": "/etc/knot-resolver",
+  "dns_interval_seconds": 0.25
 }
 CONFIG_JSON
         install -m 0600 "$stage/config.json" "$CONFIG_DIR/config.json"
@@ -143,7 +146,7 @@ original = config_path.read_bytes()
 document = json.loads(original.decode('utf-8'), object_pairs_hook=_pairs)
 upgraded = migrate_config(document)
 if upgraded != document:
-    descriptor, backup_name = tempfile.mkstemp(prefix='config.json.before-v0.3.', suffix='.bak', dir=str(config_path.parent))
+    descriptor, backup_name = tempfile.mkstemp(prefix='config.json.before-v0.4.', suffix='.bak', dir=str(config_path.parent))
     with os.fdopen(descriptor, 'wb') as backup:
         os.chmod(backup_name, 0o600)
         backup.write(original)
@@ -177,6 +180,9 @@ MIGRATE_CONFIG_PY
     fi
     log "Installed v$VERSION on this client VPS. Existing configuration and reports are preserved."
     log 'Check the inventory: antizapret-domain-check inventory'
+    log 'Audit source counts and native DNS without network checks: antizapret-domain-check audit --compare-download'
+    log 'Default scope: generated routing policies plus explicit user additions; raw registry expansion is opt-in.'
+    log 'Default DNS: discover AntiZapret real-answer resolver and selected upstreams. Unknown configurations require explicit DNS overrides.'
     log 'Run stages with saved progress: antizapret-domain-check scan'
     log 'Run one stage only: antizapret-domain-check scan --one-batch'
     log 'Default stages: 500 domains, then a 5-minute pause. Re-run scan to resume interrupted work.'

@@ -16,6 +16,8 @@ import urllib.parse
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 
+from .resolvers import applicable_resolvers, query_resolver
+
 
 DEFAULT_RESOLVER = 'https://1.1.1.1/dns-query'
 MAX_DNS_BYTES = 65536
@@ -204,7 +206,8 @@ def _result(domain, status, detail, *, http_status=None, curl_code=None, address
     return result
 
 
-def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_RESOLVER) -> dict:
+def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_RESOLVER,
+                 *, resolver_plan=None, dns_pacer=None, dns_event=None, cancelled=None) -> dict:
     """Check one domain without changing routing, following redirects or reading a body.
 
     Timeout applies to DNS and each HTTPS attempt. A curl 92 HTTP/2 failure
@@ -212,21 +215,38 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
     errors raise ProbeError; domain-specific failures return a status dictionary.
     """
     timeout = validate_timeout(timeout)
-    resolver_url = validate_resolver_url(resolver_url)
+    if resolver_plan is None:
+        resolver_url = validate_resolver_url(resolver_url)
     try:
         domain = _domain_name(domain)
     except ValueError:
         return _result(str(domain)[:253], 'skipped', 'A valid bare public DNS domain is required.')
+    if resolver_plan is not None:
+        return _check_with_resolvers(domain, timeout, resolver_plan, dns_pacer, dns_event, cancelled)
+
+    def legacy(result):
+        result['dns_reference'] = resolver_url
+        result['dns_mode'] = 'explicit-doh'
+        result['dns_checks'] = [{'resolver': resolver_url, 'transport': 'doh',
+                                 'status': 'ok' if result.get('address') else result['status'],
+                                 'addresses': [result['address']] if result.get('address') else [],
+                                 'detail': 'Explicit DoH override; native DNS discovery was not used.'}]
+        return result
+
     try:
         address = _public_address(domain, timeout, resolver_url)
     except _NonPublicAnswer as exc:
-        return _result(domain, 'skipped', str(exc))
+        return legacy(_result(domain, 'skipped', str(exc)))
     except _DNSRateLimited as exc:
-        return _result(domain, 'rate_limited', str(exc), http_status=429,
-                       curl_code=exc.curl_code, retry_after_seconds=exc.retry_after_seconds)
+        return legacy(_result(domain, 'rate_limited', str(exc), http_status=429,
+                              curl_code=exc.curl_code, retry_after_seconds=exc.retry_after_seconds))
     except _DNSProblem as exc:
-        return _result(domain, 'dns_error', str(exc))
+        return legacy(_result(domain, 'dns_error', str(exc)))
 
+    return legacy(_https_head(domain, address, timeout))
+
+
+def _https_head(domain, address, timeout):
     command = [
         'curl', '--disable', '--silent', '--show-error', '--head',
         '--proxy', '', '--noproxy', '*', '--proto', '=https', '--ipv4',
@@ -289,3 +309,34 @@ def check_domain(domain: str, timeout: float = 8.0, resolver_url: str = DEFAULT_
     return _result(domain, status, detail_prefix + 'HTTPS HEAD returned HTTP ' + str(http_status) + '; redirects were not followed.',
                    http_status=http_status, curl_code=completed.returncode, address=address,
                    retry_after_seconds=retry_after if status == 'rate_limited' else None)
+
+
+def _check_with_resolvers(domain, timeout, plan, dns_pacer, dns_event, cancelled):
+    reference = plan['reference']
+    endpoints = [reference] + [endpoint for endpoint in applicable_resolvers(plan, domain)
+                               if endpoint['id'] != reference['id']]
+    responses = []
+    for endpoint in endpoints:
+        if cancelled is not None and cancelled():
+            break
+        if dns_pacer is not None and not dns_pacer():
+            break
+        if dns_event is not None:
+            dns_event({'type': 'dns_start', 'domain': domain, 'resolver': endpoint['id']})
+        answer = query_resolver(domain, endpoint, timeout)
+        responses.append(answer)
+        if dns_event is not None:
+            dns_event({'type': 'dns_result', 'domain': domain, 'resolver': endpoint['id'], 'result': answer})
+    if len(responses) < len(endpoints) or (cancelled is not None and cancelled()):
+        result = _result(domain, 'dns_error', 'DNS matrix interrupted; this domain remains pending.')
+        result['incomplete'] = True
+    elif not responses[0].get('addresses'):
+        status = responses[0]['status'] if responses else 'cancelled'
+        result = _result(domain, 'dns_error', 'Native/reference DNS did not provide a public IPv4 address (' + status + ').')
+    else:
+        address = responses[0]['addresses'][0]
+        result = _https_head(domain, address, timeout)
+    result['dns_checks'] = responses
+    result['dns_reference'] = reference['id']
+    result['dns_mode'] = plan.get('mode', 'antizapret')
+    return result

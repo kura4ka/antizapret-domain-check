@@ -53,6 +53,149 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(list(store.candidate_domains()), [])
             self.assertEqual(list(store.iter_results()), [saved])
 
+    def test_same_canonical_context_resumes_and_changed_dns_context_resets(self):
+        targets = inventory('one.example', 'two.example')
+        context = {'dns': [{'address': '1.1.1.1', 'transport': 'udp'}],
+                   'probe_version': 2, 'criteria': {'attempts': 2, 'timeout': 8}}
+        with ScanCheckpoint(self.report_dir) as store:
+            self.assertTrue(store.prepare(targets, probe_context=context))
+            self.assertFalse(store.info()['context_changed'])
+            saved = store.save_result(result('one.example', 'candidate'))
+            initial_id = store.info()['run_id']
+            initial_sha = store.info()['probe_context_sha256']
+            self.assertEqual(len(initial_sha), 64)
+        with ScanCheckpoint(self.report_dir) as store:
+            reordered = {'criteria': {'timeout': 8, 'attempts': 2},
+                         'probe_version': 2, 'dns': context['dns']}
+            self.assertFalse(store.prepare(targets, probe_context=reordered))
+            self.assertEqual(store.info()['run_id'], initial_id)
+            self.assertEqual(store.info()['probe_context_sha256'], initial_sha)
+            self.assertEqual(store.info()['probe_context'], context)
+            self.assertEqual(list(store.iter_results()), [saved])
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(7200, 'HTTP 429 rate limit')
+            changed = {**context, 'dns': [{'address': '9.9.9.9', 'transport': 'tls'}]}
+            self.assertTrue(store.prepare(targets, probe_context=changed))
+            self.assertTrue(store.info()['context_changed'])
+            self.assertIn('context changed', store.info()['reset_reason'])
+            self.assertNotEqual(store.info()['run_id'], initial_id)
+            self.assertNotEqual(store.info()['probe_context_sha256'], initial_sha)
+            self.assertEqual(store.completed_count(), 0)
+            self.assertEqual(store.counts(), {})
+            self.assertEqual(list(store.candidate_domains()), [])
+            with patch('azcheck.checkpoint.time.time', return_value=1100):
+                self.assertEqual(store.pause_remaining(), 7100)
+
+    def test_changed_probe_criteria_or_version_starts_fresh_run(self):
+        targets = inventory('one.example')
+        previous_id = None
+        with ScanCheckpoint(self.report_dir) as store:
+            for context in ({'attempts': 2, 'timeout': 8, 'version': 1},
+                            {'attempts': 3, 'timeout': 8, 'version': 1},
+                            {'attempts': 3, 'timeout': 10, 'version': 1},
+                            {'attempts': 3, 'timeout': 10, 'version': 2}):
+                self.assertTrue(store.prepare(targets, probe_context=context))
+                self.assertNotEqual(store.info()['run_id'], previous_id)
+                self.assertEqual(store.completed_count(), 0)
+                previous_id = store.info()['run_id']
+                store.save_result(result('one.example'))
+
+    def test_first_supplied_context_invalidates_unrecorded_legacy_checks(self):
+        targets = inventory('one.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets)
+            store.save_result(result('one.example'))
+            self.assertIsNone(store.info()['probe_context'])
+            self.assertTrue(store.prepare(targets, probe_context={'resolver': '1.1.1.1'}))
+            self.assertEqual(store.completed_count(), 0)
+            self.assertTrue(store.info()['context_changed'])
+            self.assertIn('no recorded', store.info()['reset_reason'])
+
+    def test_invalid_probe_context_does_not_reset_saved_work_or_echo_values(self):
+        targets = inventory('one.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets, probe_context={'valid': True})
+            store.save_result(result('one.example'))
+            before = store.info()
+            for value in ([], 'sensitive-example', {1: 'sensitive-example'},
+                          {'value': float('nan')}, {'value': float('inf')},
+                          {'value': {'unsupported'}}):
+                with self.subTest(context_type=type(value).__name__), self.assertRaises(ValueError) as error:
+                    store.prepare(targets, probe_context=value)
+                self.assertNotIn('sensitive-example', str(error.exception))
+                self.assertEqual(store.info()['run_id'], before['run_id'])
+                self.assertEqual(store.completed_count(), 1)
+
+    def legacy_schema(self):
+        """Write the published v0.3 state layout, retaining targets/results."""
+        with sqlite3.connect(str(self.report_dir / 'checkpoint.sqlite3')) as connection:
+            connection.executescript('''
+                BEGIN;
+                ALTER TABLE state RENAME TO oldstate;
+                CREATE TABLE state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    run_id TEXT NOT NULL, started_at TEXT NOT NULL,
+                    completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+                    batch_index INTEGER NOT NULL CHECK (batch_index >= 0),
+                    pause_until REAL NOT NULL, pause_reason TEXT NOT NULL
+                );
+                INSERT INTO state SELECT singleton, run_id, started_at, completed,
+                                         batch_index, pause_until, pause_reason FROM oldstate;
+                DROP TABLE oldstate;
+                PRAGMA user_version = 1;
+                COMMIT;
+            ''')
+
+    def test_schema_one_migration_retains_results_and_cooldown_until_context_supplied(self):
+        targets = inventory('one.example', 'two.example')
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(targets)
+            saved = store.save_result(result('one.example', 'candidate'))
+            initial_id = store.info()['run_id']
+            with patch('azcheck.checkpoint.time.time', return_value=1000):
+                store.pause(4000, 'Provider pause')
+        self.legacy_schema()
+        with ScanCheckpoint(self.report_dir) as store:
+            self.assertEqual(store.info()['run_id'], initial_id)
+            self.assertEqual(list(store.iter_results()), [saved])
+            self.assertIsNone(store.info()['probe_context'])
+            self.assertFalse(store.prepare(targets))
+            with sqlite3.connect(str(store.path)) as reader:
+                self.assertEqual(reader.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertTrue(store.prepare(targets, probe_context={'dns': ['1.1.1.1']}))
+            self.assertEqual(store.completed_count(), 0)
+            with patch('azcheck.checkpoint.time.time', return_value=1100):
+                self.assertEqual(store.pause_remaining(), 3900)
+
+    def test_failed_schema_migration_rolls_back_added_column_and_version(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('one.example'))
+            store.save_result(result('one.example'))
+        self.legacy_schema()
+        path = self.report_dir / 'checkpoint.sqlite3'
+        with sqlite3.connect(str(path)) as connection:
+            connection.execute("ALTER TABLE state ADD COLUMN probe_context_sha256 TEXT NOT NULL DEFAULT ''")
+        with self.assertRaisesRegex(RuntimeError, 'checkpoint'):
+            ScanCheckpoint(self.report_dir)
+        with sqlite3.connect(str(path)) as connection:
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(state)')}
+            self.assertNotIn('probe_context_json', columns)
+            self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 1)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM results').fetchone()[0], 1)
+
+    def test_tampered_probe_context_is_reported_without_reinitialization(self):
+        with ScanCheckpoint(self.report_dir) as store:
+            store.prepare(inventory('one.example'), probe_context={'dns': ['1.1.1.1']})
+            store.save_result(result('one.example'))
+            with sqlite3.connect(str(store.path)) as connection:
+                connection.execute("UPDATE state SET probe_context_sha256 = 'incorrect'")
+            with self.assertRaisesRegex(RuntimeError, 'inconsistent probe context'):
+                store.info()
+        with self.assertRaisesRegex(RuntimeError, 'inconsistent probe context'):
+            ScanCheckpoint(self.report_dir)
+        with sqlite3.connect(str(self.report_dir / 'checkpoint.sqlite3')) as connection:
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM results').fetchone()[0], 1)
+
     def test_current_targets_exclude_removed_domains_and_resume_readded_results(self):
         with ScanCheckpoint(self.report_dir) as store:
             store.prepare(inventory('removed.example', 'kept.example'))
